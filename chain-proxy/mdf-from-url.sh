@@ -97,6 +97,16 @@ SOURCE_YAML_PATH="$TMP_SOURCE_FILE"
 grep -Eq '^proxies:[[:space:]]*$' "$SOURCE_YAML_PATH" || fail "订阅内容中未找到 proxies 段"
 grep -Eq '^proxy-groups:[[:space:]]*$' "$SOURCE_YAML_PATH" || fail "订阅内容中未找到 proxy-groups 段"
 
+HAS_SSH_DIRECT_RULE=0
+if awk '
+  /^  -[[:space:]]*DST-PORT[[:space:]]*,[[:space:]]*22[[:space:]]*,[[:space:]]*DIRECT([[:space:]]*,[[:space:]]*no-resolve)?[[:space:]]*$/ {
+    found = 1
+  }
+  END { exit(found ? 0 : 1) }
+' "$SOURCE_YAML_PATH"; then
+  HAS_SSH_DIRECT_RULE=1
+fi
+
 # 优先匹配名称包含“自动选择”的代理组；找不到时，回退到 url-test/fallback/load-balance 类型组。
 DIALER_GROUP=$(
   awk '
@@ -165,15 +175,31 @@ awk \
   -v q_user="$PROXY_USER" \
   -v q_password="$PROXY_PASSWORD" \
   -v q_dialer="$DIALER_GROUP" \
+  -v add_ssh_rule="$([ "$HAS_SSH_DIRECT_RULE" -eq 1 ] && echo 0 || echo 1)" \
   '
     BEGIN {
       inserted_proxy_node = 0
       inserted_first_group_ref = 0
+      inserted_ssh_rule = add_ssh_rule ? 0 : 1
       in_groups = 0
+      in_rules = 0
       seen_first_group = 0
       in_first_group = 0
     }
     {
+      # 在 rules: 段首行插入 SSH 放行规则（若原配置中未存在）
+      if (!inserted_ssh_rule && $0 ~ /^rules:[[:space:]]*$/) {
+        in_rules = 1
+        print $0
+        print "  - DST-PORT,22,DIRECT"
+        inserted_ssh_rule = 1
+        next
+      }
+
+      if (in_rules && $0 ~ /^[^[:space:]]/) {
+        in_rules = 0
+      }
+
       # 顶层 proxies: 段开始，先输出该行，再立即插入节点，确保位于列表首位。
       if (!inserted_proxy_node && $0 ~ /^proxies:[[:space:]]*$/) {
         print $0
@@ -229,7 +255,13 @@ awk \
       print $0
     }
     END {
-      if (!inserted_proxy_node || !inserted_first_group_ref) {
+      if (!inserted_ssh_rule) {
+        print "rules:"
+        print "  - DST-PORT,22,DIRECT"
+        inserted_ssh_rule = 1
+      }
+
+      if (!inserted_proxy_node || !inserted_first_group_ref || !inserted_ssh_rule) {
         exit 2
       }
     }

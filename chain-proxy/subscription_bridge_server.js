@@ -157,6 +157,16 @@ function hasNodeNameConflict(lines, nodeName) {
   return false;
 }
 
+function hasSshDirectRule(lines) {
+  for (const line of lines) {
+    const compact = line.replace(/\s+/g, "");
+    if (/^-DST-PORT,22,DIRECT(?:,[^#]+)?(?:#.*)?$/.test(compact)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function transformYaml(sourceText, config) {
   const hasTrailingNewline = sourceText.endsWith("\n");
   const lines = sourceText.replace(/\r\n/g, "\n").split("\n");
@@ -179,14 +189,29 @@ function transformYaml(sourceText, config) {
     fail("未找到可用的自动选择代理组（name 包含“自动选择”或 type 为 url-test/fallback/load-balance）");
   }
 
+  const alreadyHasSshDirectRule = hasSshDirectRule(lines);
   const out = [];
   let insertedProxyNode = false;
   let insertedFirstGroupRef = false;
+  let insertedSshDirectRule = alreadyHasSshDirectRule;
   let inGroups = false;
+  let inRules = false;
   let seenFirstGroup = false;
   let inFirstGroup = false;
 
   for (const line of lines) {
+    if (!insertedSshDirectRule && /^rules:\s*$/.test(line)) {
+      inRules = true;
+      out.push(line);
+      out.push("  - DST-PORT,22,DIRECT");
+      insertedSshDirectRule = true;
+      continue;
+    }
+
+    if (inRules && /^[^\s]/.test(line)) {
+      inRules = false;
+    }
+
     if (!insertedProxyNode && /^proxies:\s*$/.test(line)) {
       out.push(line);
       out.push(`  - name: ${config.newNodeName}`);
@@ -242,7 +267,13 @@ function transformYaml(sourceText, config) {
     insertedFirstGroupRef = true;
   }
 
-  if (!insertedProxyNode || !insertedFirstGroupRef) {
+  if (!insertedSshDirectRule) {
+    out.push("rules:");
+    out.push("  - DST-PORT,22,DIRECT");
+    insertedSshDirectRule = true;
+  }
+
+  if (!insertedProxyNode || !insertedFirstGroupRef || !insertedSshDirectRule) {
     fail("生成新 YAML 失败（可能未正确识别 proxies 或第一个 proxy-group）");
   }
 
