@@ -7,6 +7,12 @@ const http = require("node:http");
 const path = require("node:path");
 const { URL } = require("node:url");
 
+const { createLogger } = require("./bridge/logger");
+const { buildRegistry } = require("./bridge/registry");
+const { resolveSubscriptionLink } = require("./bridge/link_utils");
+const { fetchTextWithTimeout, extractClashYaml, stripBom } = require("./bridge/upstream_parser");
+const { transformYaml } = require("./bridge/yaml_transform");
+
 const SCRIPT_FILE = path.basename(__filename);
 const SCRIPT_STEM = SCRIPT_FILE.replace(/\.[^.]+$/, "");
 const SELF_NODE_CMD = `node "${SCRIPT_FILE}"`;
@@ -15,453 +21,45 @@ function selfNodeCommand(args = "") {
 }
 
 /*
-作用:
-1) 提供一个可供 Clash 导入/更新的订阅链接 B（默认路径 /sub）。
-2) 每次请求 B 时，实时拉取订阅 A。
-3) 在返回的 YAML 中新增链式代理节点（dialer-proxy）。
-4) 保持原有配置，仅做增量插入后返回给 Clash。
+功能概述:
+1) 从 proxy/subscription.csv 读取多组 A 订阅 + B_TOKEN。
+2) 从 proxy/proxy.csv 读取多条链式代理节点（socks5）。
+3) 为每组 A/B_TOKEN 生成一条订阅链接 B。
+4) 当客户端请求某个 B(token=xxx) 时，只拉取对应的 A，不会拉取其他 A。
+5) 解析或改写失败的组合会在启动预检阶段被跳过。
 
-使用方法:
-1) 先填写下面“用户手动填写”区域。
-2) 启动服务:
-   - 前台运行: node <脚本名>.js start
-   - 后台运行: nohup node <脚本名>.js start > bridge.log 2>&1 &
-   - 前台和后台都会输出日志，且同时写入 LOG_FILE 指定文件
-   - 当 PUBLIC_BASE_URL 为空时，会自动探测公网 IP 并用于订阅链接 B
-3) 在 Clash 中导入脚本启动日志里输出的“订阅链接 B”。
-4) 查看状态: node <脚本名>.js status
-5) 停止服务: node <脚本名>.js stop
-
-停止进程:
-1) 启动该进程的同一终端: Ctrl + C
-2) 任意终端: node <脚本名>.js stop
+CSV 格式:
+1) proxy/subscription.csv（必填列）
+   - id,a_url,b_token,enabled
+   - id: 可选，留空自动生成
+   - a_url: A 订阅链接
+   - b_token: B 链接 token（必须唯一）
+   - enabled: 可选，1/0/true/false，默认 true
+2) proxy/proxy.csv（必填列）
+   - name,server,port,username,password,enabled
+   - enabled: 可选，1/0/true/false，默认 true
 */
 
 // ===== 用户手动填写 =====
-// 订阅 A 链接（必须是 http/https）
-const SUBSCRIPTION_URL_A = "";
-// 新增代理节点信息，格式: IP:PORT:USER:PASSWORD
-const NEW_PROXY_INFO = "";
-// 新增节点名称
-const NEW_NODE_NAME = "PrivateProxy";
-// 监听地址和端口（B 订阅对外地址）
+const SUBSCRIPTION_CSV_FILE = path.resolve(__dirname, "proxy", "subscription.csv");
+const PROXY_CSV_FILE = path.resolve(__dirname, "proxy", "proxy.csv");
+
 const HOST = "0.0.0.0";
 const PORT = 8090;
-// B 订阅路径，例如 /sub
 const B_PATH = "/sub";
-// 可选：对外访问 B 的基础地址（建议远程服务器填写域名，如 https://sub.example.com）
-// 留空时会自动探测远程主机公网 IP 来生成订阅链接
 const PUBLIC_BASE_URL = "";
-// 可选：B 订阅访问令牌（留空表示不鉴权）
-const B_TOKEN = "";
-// 可选：拉取 A 的超时时间（毫秒）
+
 const FETCH_TIMEOUT_MS = 20000;
-// 可选：探测公网 IP 的请求超时时间（毫秒）
 const PUBLIC_IP_DETECT_TIMEOUT_MS = 3500;
-// 可选：上游订阅 A 需要 Authorization 时填写，例如 "Bearer xxx"
 const UPSTREAM_AUTH_HEADER = "";
-// 服务 PID 文件路径（用于 stop/status）
+const PRECHECK_ON_START = true;
+
 const PID_FILE = path.resolve(__dirname, `${SCRIPT_STEM}.pid`);
-// 服务日志文件路径（所有日志统一写入此文件）
 const LOG_FILE = path.resolve(__dirname, `${SCRIPT_STEM}.log`);
 // ======================
 
 function fail(message) {
   throw new Error(message);
-}
-
-function log(level, message) {
-  const ts = new Date().toISOString();
-  const line = `[${ts}] [${level}] ${message}`;
-  console.log(line);
-  try {
-    fs.appendFileSync(LOG_FILE, `${line}\n`, "utf8");
-  } catch (error) {
-    // 日志写文件失败时不影响主流程，只输出到控制台
-    console.error(`[${ts}] [WARN] 写入日志文件失败: ${error.message || String(error)}`);
-  }
-}
-
-function logInfo(message) {
-  log("INFO", message);
-}
-
-function logWarn(message) {
-  log("WARN", message);
-}
-
-function logError(message) {
-  log("ERROR", message);
-}
-
-function stripWrappedQuotes(value) {
-  const v = value.trim();
-  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-    return v.slice(1, -1);
-  }
-  return v;
-}
-
-function parseProxyInfo(raw) {
-  const parts = raw.split(":");
-  if (parts.length !== 4) {
-    fail("NEW_PROXY_INFO 格式错误，应为 IP:PORT:USER:PASSWORD");
-  }
-  const [ip, port, username, password] = parts;
-  if (!/^\d+$/.test(port)) {
-    fail("NEW_PROXY_INFO 中 PORT 必须是数字");
-  }
-  return { ip, port, username, password };
-}
-
-function stripBom(text) {
-  if (!text) {
-    return text;
-  }
-  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-}
-
-function isTopLevelKeyLine(line, key) {
-  const withoutBom = line.replace(/^\uFEFF/, "");
-  if (/^\s/.test(withoutBom)) {
-    return false;
-  }
-  return new RegExp(`^${key}:\\s*$`).test(withoutBom);
-}
-
-function looksLikeClashYamlText(text) {
-  const normalized = stripBom(text || "").replace(/\r\n/g, "\n");
-  const lines = normalized.split("\n");
-  const hasProxies = lines.some((line) => isTopLevelKeyLine(line, "proxies"));
-  const hasProxyGroups = lines.some((line) => isTopLevelKeyLine(line, "proxy-groups"));
-  return hasProxies && hasProxyGroups;
-}
-
-function safeDecodeURIComponent(text) {
-  try {
-    return decodeURIComponent(text);
-  } catch {
-    return text;
-  }
-}
-
-function tryDecodeBase64(text) {
-  const compact = (text || "").trim().replace(/\s+/g, "");
-  if (compact.length < 32) {
-    return "";
-  }
-  if (!/^[A-Za-z0-9+/_=-]+$/.test(compact)) {
-    return "";
-  }
-  const normalized = compact.replace(/-/g, "+").replace(/_/g, "/");
-  try {
-    const decoded = Buffer.from(normalized, "base64").toString("utf8");
-    if (!decoded || /[\x00-\x08\x0E-\x1F]/.test(decoded)) {
-      return "";
-    }
-    return decoded;
-  } catch {
-    return "";
-  }
-}
-
-function findClashYamlInJsonValue(value, depth = 0) {
-  if (depth > 8 || value == null) {
-    return "";
-  }
-
-  if (typeof value === "string") {
-    const candidates = [value, safeDecodeURIComponent(value), tryDecodeBase64(value)];
-    for (const c of candidates) {
-      if (c && looksLikeClashYamlText(c)) {
-        return stripBom(c);
-      }
-    }
-    for (const c of candidates) {
-      if (!c) {
-        continue;
-      }
-      const t = c.trim();
-      if (!(t.startsWith("{") || t.startsWith("["))) {
-        continue;
-      }
-      try {
-        const nested = JSON.parse(t);
-        const nestedYaml = findClashYamlInJsonValue(nested, depth + 1);
-        if (nestedYaml) {
-          return nestedYaml;
-        }
-      } catch {
-        // ignore invalid nested json
-      }
-    }
-    return "";
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const yaml = findClashYamlInJsonValue(item, depth + 1);
-      if (yaml) {
-        return yaml;
-      }
-    }
-    return "";
-  }
-
-  if (typeof value === "object") {
-    const preferredKeys = ["clash", "yaml", "config", "content", "data", "result", "payload", "body"];
-    for (const k of preferredKeys) {
-      if (Object.prototype.hasOwnProperty.call(value, k)) {
-        const yaml = findClashYamlInJsonValue(value[k], depth + 1);
-        if (yaml) {
-          return yaml;
-        }
-      }
-    }
-    for (const k of Object.keys(value)) {
-      if (preferredKeys.includes(k)) {
-        continue;
-      }
-      const yaml = findClashYamlInJsonValue(value[k], depth + 1);
-      if (yaml) {
-        return yaml;
-      }
-    }
-  }
-
-  return "";
-}
-
-function extractClashYaml(rawText) {
-  const raw = stripBom(rawText || "");
-  if (looksLikeClashYamlText(raw)) {
-    return { yaml: raw, mode: "direct_yaml" };
-  }
-
-  const decodedUrl = safeDecodeURIComponent(raw);
-  if (decodedUrl !== raw && looksLikeClashYamlText(decodedUrl)) {
-    return { yaml: stripBom(decodedUrl), mode: "url_decoded_yaml" };
-  }
-
-  const decodedB64 = tryDecodeBase64(raw);
-  if (decodedB64 && looksLikeClashYamlText(decodedB64)) {
-    return { yaml: stripBom(decodedB64), mode: "base64_yaml" };
-  }
-
-  const jsonCandidates = [raw, decodedUrl, decodedB64].filter(Boolean);
-  for (const candidate of jsonCandidates) {
-    const t = candidate.trim();
-    if (!(t.startsWith("{") || t.startsWith("["))) {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(t);
-      const yaml = findClashYamlInJsonValue(parsed);
-      if (yaml) {
-        return { yaml, mode: "json_wrapped_yaml" };
-      }
-    } catch {
-      // ignore invalid json
-    }
-  }
-
-  return null;
-}
-
-function detectDialerGroup(lines) {
-  let inGroups = false;
-  let currentName = "";
-  let byName = "";
-  let byType = "";
-
-  for (const line of lines) {
-    if (isTopLevelKeyLine(line, "proxy-groups")) {
-      inGroups = true;
-      continue;
-    }
-    if (inGroups && /^[^\s]/.test(line)) {
-      inGroups = false;
-    }
-    if (!inGroups) {
-      continue;
-    }
-
-    if (/^  - name:\s*/.test(line)) {
-      currentName = stripWrappedQuotes(line.replace(/^  - name:\s*/, ""));
-      if (!byName && currentName.includes("自动选择")) {
-        byName = currentName;
-      }
-      continue;
-    }
-
-    if (/^    type:\s*/.test(line)) {
-      const type = stripWrappedQuotes(line.replace(/^    type:\s*/, ""));
-      if (!byType && (type === "url-test" || type === "fallback" || type === "load-balance") && currentName) {
-        byType = currentName;
-      }
-    }
-  }
-
-  return byName || byType;
-}
-
-function hasNodeNameConflict(lines, nodeName) {
-  for (const line of lines) {
-    if (!/^  - name:\s*/.test(line)) {
-      continue;
-    }
-    const name = stripWrappedQuotes(line.replace(/^  - name:\s*/, ""));
-    if (name === nodeName) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function hasSshDirectRule(lines) {
-  for (const line of lines) {
-    const compact = line.replace(/\s+/g, "");
-    if (/^-DST-PORT,22,DIRECT(?:,[^#]+)?(?:#.*)?$/.test(compact)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function transformYaml(sourceText, config) {
-  const normalizedSource = stripBom(sourceText || "");
-  const hasTrailingNewline = normalizedSource.endsWith("\n");
-  const lines = normalizedSource.replace(/\r\n/g, "\n").split("\n");
-
-  const hasProxies = lines.some((line) => isTopLevelKeyLine(line, "proxies"));
-  const hasProxyGroups = lines.some((line) => isTopLevelKeyLine(line, "proxy-groups"));
-  if (!hasProxies) {
-    fail("订阅内容中未找到 proxies 段");
-  }
-  if (!hasProxyGroups) {
-    fail("订阅内容中未找到 proxy-groups 段");
-  }
-
-  if (hasNodeNameConflict(lines, config.newNodeName)) {
-    fail(`节点名已存在: ${config.newNodeName}，请修改 NEW_NODE_NAME`);
-  }
-
-  const dialerGroup = detectDialerGroup(lines);
-  if (!dialerGroup) {
-    fail("未找到可用的自动选择代理组（name 包含“自动选择”或 type 为 url-test/fallback/load-balance）");
-  }
-
-  const alreadyHasSshDirectRule = hasSshDirectRule(lines);
-  const out = [];
-  let insertedProxyNode = false;
-  let insertedFirstGroupRef = false;
-  let insertedSshDirectRule = alreadyHasSshDirectRule;
-  let inGroups = false;
-  let inRules = false;
-  let seenFirstGroup = false;
-  let inFirstGroup = false;
-
-  for (const line of lines) {
-    if (!insertedSshDirectRule && isTopLevelKeyLine(line, "rules")) {
-      inRules = true;
-      out.push(line);
-      out.push("  - DST-PORT,22,DIRECT");
-      insertedSshDirectRule = true;
-      continue;
-    }
-
-    if (inRules && /^[^\s]/.test(line)) {
-      inRules = false;
-    }
-
-    if (!insertedProxyNode && isTopLevelKeyLine(line, "proxies")) {
-      out.push(line);
-      out.push(`  - name: ${config.newNodeName}`);
-      out.push("    type: socks5");
-      out.push(`    server: ${config.proxy.ip}`);
-      out.push(`    port: ${config.proxy.port}`);
-      out.push(`    username: ${config.proxy.username}`);
-      out.push(`    password: ${config.proxy.password}`);
-      out.push(`    dialer-proxy: ${dialerGroup}`);
-      insertedProxyNode = true;
-      continue;
-    }
-
-    if (isTopLevelKeyLine(line, "proxy-groups")) {
-      inGroups = true;
-    } else if (inGroups && /^[^\s]/.test(line)) {
-      if (inFirstGroup && !insertedFirstGroupRef) {
-        out.push("    proxies:");
-        out.push(`      - ${config.newNodeName}`);
-        insertedFirstGroupRef = true;
-      }
-      inGroups = false;
-      inFirstGroup = false;
-    }
-
-    if (inGroups) {
-      if (!seenFirstGroup && /^  - name:\s*/.test(line)) {
-        seenFirstGroup = true;
-        inFirstGroup = true;
-      } else if (seenFirstGroup && inFirstGroup && /^  - name:\s*/.test(line)) {
-        if (!insertedFirstGroupRef) {
-          out.push("    proxies:");
-          out.push(`      - ${config.newNodeName}`);
-          insertedFirstGroupRef = true;
-        }
-        inFirstGroup = false;
-      }
-
-      if (inFirstGroup && !insertedFirstGroupRef && /^    proxies:\s*$/.test(line)) {
-        out.push(line);
-        out.push(`      - ${config.newNodeName}`);
-        insertedFirstGroupRef = true;
-        continue;
-      }
-    }
-
-    out.push(line);
-  }
-
-  if (inGroups && inFirstGroup && !insertedFirstGroupRef) {
-    out.push("    proxies:");
-    out.push(`      - ${config.newNodeName}`);
-    insertedFirstGroupRef = true;
-  }
-
-  if (!insertedSshDirectRule) {
-    out.push("rules:");
-    out.push("  - DST-PORT,22,DIRECT");
-    insertedSshDirectRule = true;
-  }
-
-  if (!insertedProxyNode || !insertedFirstGroupRef || !insertedSshDirectRule) {
-    fail("生成新 YAML 失败（可能未正确识别 proxies 或第一个 proxy-group）");
-  }
-
-  const body = out.join("\n");
-  return {
-    body: hasTrailingNewline ? `${body}\n` : body,
-    dialerGroup,
-  };
-}
-
-async function fetchTextWithTimeout(url, timeoutMs, headers = {}, errorPrefix = "请求失败") {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers,
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      fail(`${errorPrefix}，HTTP ${response.status}`);
-    }
-    return await response.text();
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 function send(res, status, body, headers = {}) {
@@ -495,13 +93,6 @@ function readPidFile(pidFile) {
   return Number(raw);
 }
 
-function getPidFilePath() {
-  if (!PID_FILE) {
-    fail("PID_FILE 不能为空");
-  }
-  return PID_FILE;
-}
-
 function removePidFileIfOwned(pidFile, expectedPid) {
   const pidInFile = readPidFile(pidFile);
   if (pidInFile === expectedPid && fs.existsSync(pidFile)) {
@@ -520,120 +111,29 @@ function saveCurrentPid(pidFile) {
   fs.writeFileSync(pidFile, `${process.pid}\n`, "utf8");
 }
 
-function buildTokenHint(cfg) {
-  return cfg.bToken ? `?token=${encodeURIComponent(cfg.bToken)}` : "";
-}
-
-function normalizePath(p) {
-  return p.startsWith("/") ? p : `/${p}`;
-}
-
-function isWildcardListenHost(host) {
-  return host === "0.0.0.0" || host === "::";
-}
-
-function extractIpv4(text) {
-  const m = (text || "").match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
-  if (!m) {
-    return "";
-  }
-  const ip = m[0];
-  const parts = ip.split(".").map((x) => Number(x));
-  if (parts.length !== 4) {
-    return "";
-  }
-  if (parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
-    return "";
-  }
-  return ip;
-}
-
-async function detectPublicIp(timeoutMs) {
-  const urls = [
-    "https://api.ipify.org",
-    "https://ifconfig.me/ip",
-    "https://ipv4.icanhazip.com",
-  ];
-
-  for (const u of urls) {
-    try {
-      const body = await fetchTextWithTimeout(
-        u,
-        timeoutMs,
-        { "user-agent": "subscription-bridge/1.0", accept: "text/plain,*/*" },
-        "探测公网 IP 失败"
-      );
-      const ip = extractIpv4(body.trim());
-      if (ip) {
-        return ip;
-      }
-    } catch {
-      // 尝试下一个探测源
-    }
-  }
-  return "";
-}
-
-async function resolveSubscriptionLink(cfg, options = {}) {
-  const tokenHint = buildTokenHint(cfg);
-  const normalizedPath = normalizePath(cfg.bPath);
-
-  if (cfg.publicBaseUrl) {
-    const base = cfg.publicBaseUrl.replace(/\/+$/, "");
-    return `${base}${normalizedPath}${tokenHint}`;
-  }
-
-  let hostForLink = cfg.host;
-  if (isWildcardListenHost(cfg.host)) {
-    const publicIp = await detectPublicIp(cfg.publicIpDetectTimeoutMs);
-    if (!publicIp) {
-      if (options.allowPlaceholder) {
-        return "(无法自动探测公网IP，请设置 PUBLIC_BASE_URL)";
-      }
-      fail("无法自动探测公网IP，请设置 PUBLIC_BASE_URL（例如 http://你的公网IP:8090）");
-    }
-    hostForLink = publicIp;
-  }
-
-  return `http://${hostForLink}:${cfg.port}${normalizedPath}${tokenHint}`;
+function getRequestToken(req, reqUrl) {
+  const tokenFromQuery = reqUrl.searchParams.get("token") || "";
+  const tokenFromHeader = (req.headers["x-sub-token"] || "").toString();
+  return tokenFromQuery || tokenFromHeader;
 }
 
 function createRuntimeConfig() {
-  const subscriptionUrlA = SUBSCRIPTION_URL_A;
-  const newProxyInfo = NEW_PROXY_INFO;
-  const newNodeName = NEW_NODE_NAME;
-  const host = HOST;
-  const port = Number(PORT);
-  const bPath = B_PATH;
-  const publicBaseUrl = PUBLIC_BASE_URL.trim();
-  const bToken = B_TOKEN;
-  const fetchTimeoutMs = Number(FETCH_TIMEOUT_MS);
-  const publicIpDetectTimeoutMs = Number(PUBLIC_IP_DETECT_TIMEOUT_MS);
-  const upstreamAuthHeader = UPSTREAM_AUTH_HEADER;
-  const pidFile = PID_FILE;
-
-  if (!subscriptionUrlA || !/^https?:\/\//.test(subscriptionUrlA)) {
-    fail("请设置 SUBSCRIPTION_URL_A，且必须为 http/https 链接");
-  }
-  if (!newProxyInfo) {
-    fail("请设置 NEW_PROXY_INFO，格式为 IP:PORT:USER:PASSWORD");
-  }
-  if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+  if (!Number.isFinite(PORT) || PORT <= 0 || PORT > 65535) {
     fail("PORT 必须是 1-65535 的整数");
   }
-  if (!bPath.startsWith("/")) {
+  if (!B_PATH.startsWith("/")) {
     fail("B_PATH 必须以 / 开头，例如 /sub");
   }
-  if (publicBaseUrl && !/^https?:\/\//.test(publicBaseUrl)) {
+  if (PUBLIC_BASE_URL && !/^https?:\/\//.test(PUBLIC_BASE_URL)) {
     fail("PUBLIC_BASE_URL 必须是 http/https 链接，或留空");
   }
-  if (!Number.isFinite(fetchTimeoutMs) || fetchTimeoutMs < 1000) {
+  if (!Number.isFinite(FETCH_TIMEOUT_MS) || FETCH_TIMEOUT_MS < 1000) {
     fail("FETCH_TIMEOUT_MS 不能小于 1000");
   }
-  if (!Number.isFinite(publicIpDetectTimeoutMs) || publicIpDetectTimeoutMs < 500) {
+  if (!Number.isFinite(PUBLIC_IP_DETECT_TIMEOUT_MS) || PUBLIC_IP_DETECT_TIMEOUT_MS < 500) {
     fail("PUBLIC_IP_DETECT_TIMEOUT_MS 不能小于 500");
   }
-  if (!pidFile) {
+  if (!PID_FILE) {
     fail("PID_FILE 不能为空");
   }
   if (!LOG_FILE) {
@@ -641,102 +141,135 @@ function createRuntimeConfig() {
   }
 
   return {
-    subscriptionUrlA,
-    proxy: parseProxyInfo(newProxyInfo),
-    newNodeName,
-    host,
-    port,
-    bPath,
-    publicBaseUrl,
-    bToken,
-    fetchTimeoutMs,
-    publicIpDetectTimeoutMs,
-    upstreamAuthHeader,
-    pidFile,
+    subscriptionCsvFile: SUBSCRIPTION_CSV_FILE,
+    proxyCsvFile: PROXY_CSV_FILE,
+    host: HOST,
+    port: Number(PORT),
+    bPath: B_PATH,
+    publicBaseUrl: PUBLIC_BASE_URL.trim(),
+    fetchTimeoutMs: Number(FETCH_TIMEOUT_MS),
+    publicIpDetectTimeoutMs: Number(PUBLIC_IP_DETECT_TIMEOUT_MS),
+    upstreamAuthHeader: UPSTREAM_AUTH_HEADER,
+    precheckOnStart: PRECHECK_ON_START,
+    pidFile: PID_FILE,
+    logFile: LOG_FILE,
   };
 }
 
-async function handleSubscriptionRequest(req, res, cfg) {
-  const start = Date.now();
-  const remoteIp = req.socket?.remoteAddress || "unknown";
-  const reqMethod = req.method || "UNKNOWN";
-  const reqPath = req.url || "/";
-  let statusCode = 500;
-  let detail = "";
-  const reply = (status, body, headers = {}) => {
-    statusCode = status;
-    send(res, status, body, headers);
-  };
+async function buildLinkRows(cfg, registry, logger, allowPlaceholderLink) {
+  const activeTokenMap = new Map();
+  const links = [];
+  const linkFailed = [];
 
-  try {
-    if (req.method !== "GET") {
-      detail = "method_not_allowed";
-      reply(405, "Method Not Allowed");
-      return;
-    }
-
-    const reqUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-    if (reqUrl.pathname !== cfg.bPath) {
-      detail = "path_not_match";
-      reply(404, "Not Found");
-      return;
-    }
-
-    if (cfg.bToken) {
-      const tokenFromQuery = reqUrl.searchParams.get("token") || "";
-      const tokenFromHeader = (req.headers["x-sub-token"] || "").toString();
-      if (tokenFromQuery !== cfg.bToken && tokenFromHeader !== cfg.bToken) {
-        detail = "unauthorized";
-        reply(401, "Unauthorized");
-        return;
+  for (const sub of registry.activeSubs) {
+    try {
+      const link = await resolveSubscriptionLink(cfg, sub.token, { allowPlaceholder: !!allowPlaceholderLink });
+      if (!link || link.startsWith("(")) {
+        throw new Error(link || "empty_link");
       }
+      links.push({ sub, link });
+      activeTokenMap.set(sub.token, sub);
+    } catch (error) {
+      linkFailed.push({
+        sub,
+        reason: error.message || String(error),
+      });
+      logger.warn(`跳过订阅 id=${sub.id} token=${sub.token} 原因: 生成 B 链接失败: ${error.message || String(error)}`);
     }
-
-    const headers = {
-      "user-agent": "subscription-bridge/1.0",
-      accept: "*/*",
-    };
-    if (cfg.upstreamAuthHeader) {
-      headers.authorization = cfg.upstreamAuthHeader;
-    }
-
-    const source = await fetchTextWithTimeout(cfg.subscriptionUrlA, cfg.fetchTimeoutMs, headers, "拉取订阅 A 失败");
-    const extracted = extractClashYaml(source);
-    if (!extracted) {
-      const snippet = stripBom(source || "").replace(/\s+/g, " ").slice(0, 200);
-      fail(`上游响应无法识别为 Clash YAML（可能是 JSON/HTML/链接文本），片段: ${snippet}`);
-    }
-    logInfo(`上游订阅解析模式: ${extracted.mode}`);
-
-    const transformed = transformYaml(extracted.yaml, {
-      proxy: cfg.proxy,
-      newNodeName: cfg.newNodeName,
-    });
-
-    detail = `ok dialer=${transformed.dialerGroup}`;
-    reply(200, transformed.body, {
-      "content-type": "application/yaml; charset=utf-8",
-      "cache-control": "no-store",
-      "x-dialer-proxy-group": encodeURIComponent(transformed.dialerGroup),
-    });
-  } catch (error) {
-    detail = `error=${(error.message || String(error)).replace(/\s+/g, " ").slice(0, 300)}`;
-    reply(500, `Internal Error: ${error.message || String(error)}`);
-  } finally {
-    const costMs = Date.now() - start;
-    logInfo(`REQ ${remoteIp} "${reqMethod} ${reqPath}" ${statusCode} ${costMs}ms ${detail}`);
   }
+
+  return {
+    activeTokenMap,
+    links,
+    linkFailed,
+  };
 }
 
 async function startServer() {
   const cfg = createRuntimeConfig();
-  const subscriptionLink = await resolveSubscriptionLink(cfg);
-  saveCurrentPid(cfg.pidFile);
+  const logger = createLogger(cfg.logFile);
+  const registry = await buildRegistry(cfg, logger);
+  const linkResult = await buildLinkRows(cfg, registry, logger, false);
 
+  if (linkResult.activeTokenMap.size === 0) {
+    fail("没有可用的订阅组合（可能全部预检失败或链接生成失败）");
+  }
+
+  saveCurrentPid(cfg.pidFile);
   let stopping = false;
 
-  const server = http.createServer((req, res) => {
-    handleSubscriptionRequest(req, res, cfg);
+  const server = http.createServer(async (req, res) => {
+    const start = Date.now();
+    const remoteIp = req.socket?.remoteAddress || "unknown";
+    const reqMethod = req.method || "UNKNOWN";
+    const reqPath = req.url || "/";
+    let statusCode = 500;
+    let detail = "";
+
+    const reply = (status, body, headers = {}) => {
+      statusCode = status;
+      send(res, status, body, headers);
+    };
+
+    try {
+      if (req.method !== "GET") {
+        detail = "method_not_allowed";
+        reply(405, "Method Not Allowed");
+        return;
+      }
+
+      const reqUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+      if (reqUrl.pathname !== cfg.bPath) {
+        detail = "path_not_match";
+        reply(404, "Not Found");
+        return;
+      }
+
+      const token = getRequestToken(req, reqUrl);
+      if (!token) {
+        detail = "missing_token";
+        reply(401, "Unauthorized: missing token");
+        return;
+      }
+
+      const sub = linkResult.activeTokenMap.get(token);
+      if (!sub) {
+        detail = "token_not_found";
+        reply(401, "Unauthorized: invalid token");
+        return;
+      }
+
+      const headers = {
+        "user-agent": "subscription-bridge/1.0",
+        accept: "*/*",
+      };
+      if (cfg.upstreamAuthHeader) {
+        headers.authorization = cfg.upstreamAuthHeader;
+      }
+
+      const source = await fetchTextWithTimeout(sub.aUrl, cfg.fetchTimeoutMs, headers, `拉取订阅 A(${sub.id}) 失败`);
+      const extracted = extractClashYaml(source);
+      if (!extracted) {
+        const snippet = stripBom(source || "").replace(/\s+/g, " ").slice(0, 200);
+        fail(`上游响应无法识别为 Clash YAML（id=${sub.id}），片段: ${snippet}`);
+      }
+
+      const transformed = transformYaml(extracted.yaml, registry.proxyNodes);
+      detail = `ok id=${sub.id} mode=${extracted.mode} dialer=${transformed.dialerGroup} added=${transformed.addedNodeNames.length}`;
+
+      reply(200, transformed.body, {
+        "content-type": "application/yaml; charset=utf-8",
+        "cache-control": "no-store",
+        "x-dialer-proxy-group": encodeURIComponent(transformed.dialerGroup),
+        "x-subscription-id": sub.id,
+      });
+    } catch (error) {
+      detail = `error=${(error.message || String(error)).replace(/\s+/g, " ").slice(0, 260)}`;
+      reply(500, `Internal Error: ${error.message || String(error)}`);
+    } finally {
+      const costMs = Date.now() - start;
+      logger.info(`REQ ${remoteIp} "${reqMethod} ${reqPath}" ${statusCode} ${costMs}ms ${detail}`);
+    }
   });
 
   const shutdown = (signalName) => {
@@ -744,15 +277,12 @@ async function startServer() {
       return;
     }
     stopping = true;
-    logWarn(`收到 ${signalName}，正在停止服务...`);
-
+    logger.warn(`收到 ${signalName}，正在停止服务...`);
     server.close(() => {
       removePidFileIfOwned(cfg.pidFile, process.pid);
-      logInfo("服务已停止");
+      logger.info("服务已停止");
       process.exit(0);
     });
-
-    // 兜底超时，避免 server.close 长时间不返回
     setTimeout(() => {
       removePidFileIfOwned(cfg.pidFile, process.pid);
       process.exit(1);
@@ -763,77 +293,102 @@ async function startServer() {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   server.listen(cfg.port, cfg.host, () => {
-    logInfo(`进程 PID: ${process.pid}`);
-    logInfo("订阅中转服务已启动");
-    logInfo(`订阅链接 B: ${subscriptionLink}`);
-    logInfo(`日志文件: ${LOG_FILE}`);
-    logInfo(`上游订阅 A: ${cfg.subscriptionUrlA}`);
-    logInfo(`停止命令: ${selfNodeCommand("stop")}`);
-    logInfo(`状态命令: ${selfNodeCommand("status")}`);
+    logger.info(`进程 PID: ${process.pid}`);
+    logger.info("订阅中转服务已启动");
+    logger.info(`日志文件: ${cfg.logFile}`);
+    logger.info(`已加载代理节点数量: ${registry.proxyNodes.length}`);
+    logger.info(`订阅预检: active=${registry.activeSubs.length}, skipped=${registry.skippedSubs.length}, link_failed=${linkResult.linkFailed.length}`);
+    for (const row of linkResult.links) {
+      logger.info(`订阅链接 B [id=${row.sub.id}, token=${row.sub.token}] => ${row.link}`);
+    }
+    logger.info(`停止命令: ${selfNodeCommand("stop")}`);
+    logger.info(`状态命令: ${selfNodeCommand("status")}`);
   });
 
   server.on("error", (err) => {
     removePidFileIfOwned(cfg.pidFile, process.pid);
-    logError(`服务启动失败: ${err.message || String(err)}`);
+    logger.error(`服务启动失败: ${err.message || String(err)}`);
     process.exit(1);
   });
 }
 
 function stopServer() {
-  const pidFile = getPidFilePath();
-  const pid = readPidFile(pidFile);
+  const cfg = createRuntimeConfig();
+  const logger = createLogger(cfg.logFile);
+  const pid = readPidFile(cfg.pidFile);
+
   if (!pid) {
-    logInfo("服务未运行（未找到 PID 文件）");
+    logger.info("服务未运行（未找到 PID 文件）");
     return;
   }
   if (!isProcessRunning(pid)) {
-    if (fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
+    if (fs.existsSync(cfg.pidFile)) {
+      fs.unlinkSync(cfg.pidFile);
     }
-    logWarn(`检测到过期 PID(${pid})，已清理 PID 文件`);
+    logger.warn(`检测到过期 PID(${pid})，已清理 PID 文件`);
     return;
   }
-
   process.kill(pid, "SIGTERM");
-  logInfo(`已向 PID ${pid} 发送停止信号(SIGTERM)`);
+  logger.info(`已向 PID ${pid} 发送停止信号(SIGTERM)`);
 }
 
 async function showStatus() {
-  const pidFile = getPidFilePath();
-  const pid = readPidFile(pidFile);
-
-  let subscriptionLink = "";
-  try {
-    subscriptionLink = await resolveSubscriptionLink(createRuntimeConfig(), { allowPlaceholder: true });
-  } catch {
-    subscriptionLink = "(配置不完整，暂无法生成链接)";
-  }
-
-  if (pid && isProcessRunning(pid)) {
-    logInfo("服务状态: 运行中");
-    logInfo(`PID: ${pid}`);
-    logInfo(`订阅链接 B: ${subscriptionLink}`);
-    return;
-  }
-
-  if (pid && !isProcessRunning(pid) && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
-  }
-  logInfo("服务状态: 未运行");
-  logInfo(`订阅链接 B: ${subscriptionLink}`);
-}
-
-async function showLink() {
   const cfg = createRuntimeConfig();
-  console.log(await resolveSubscriptionLink(cfg));
+  const logger = createLogger(cfg.logFile);
+  const pid = readPidFile(cfg.pidFile);
+  const running = !!(pid && isProcessRunning(pid));
+
+  const registry = await buildRegistry(cfg, logger);
+  const linkResult = await buildLinkRows(cfg, registry, logger, true);
+
+  if (!running && pid && fs.existsSync(cfg.pidFile)) {
+    fs.unlinkSync(cfg.pidFile);
+  }
+
+  logger.info(`服务状态: ${running ? "运行中" : "未运行"}`);
+  if (running) {
+    logger.info(`PID: ${pid}`);
+  }
+  logger.info(`订阅组合: active=${registry.activeSubs.length}, skipped=${registry.skippedSubs.length}, link_failed=${linkResult.linkFailed.length}`);
+  for (const row of linkResult.links) {
+    logger.info(`B [id=${row.sub.id}, token=${row.sub.token}] => ${row.link}`);
+  }
 }
 
-// 命令:
-// 1) start(默认): 启动服务
-// 2) stop: 停止服务（按 PID_FILE）
-// 3) status: 查看服务状态
-// 4) link: 输出订阅链接 B
-// 5) --transform-local <inputYamlPath> <outputYamlPath>: 本地改写测试（不启动服务）
+async function showLinks() {
+  const cfg = createRuntimeConfig();
+  const logger = createLogger(cfg.logFile);
+  const registry = await buildRegistry(cfg, logger);
+  const linkResult = await buildLinkRows(cfg, registry, logger, false);
+
+  for (const row of linkResult.links) {
+    console.log(`${row.sub.id},${row.sub.token},${row.link}`);
+  }
+}
+
+async function testTransformLocal(inputPath, outputPath) {
+  const cfg = createRuntimeConfig();
+  const logger = createLogger(cfg.logFile);
+  const registry = await buildRegistry(
+    {
+      ...cfg,
+      precheckOnStart: false,
+    },
+    logger
+  );
+
+  const source = fs.readFileSync(inputPath, "utf8");
+  const extracted = extractClashYaml(source);
+  if (!extracted) {
+    fail("输入文件无法识别为 Clash YAML");
+  }
+  const transformed = transformYaml(extracted.yaml, registry.proxyNodes);
+  fs.writeFileSync(outputPath, transformed.body, "utf8");
+  console.log(`本地改写完成: ${outputPath}`);
+  console.log(`dialer-proxy 使用代理组: ${transformed.dialerGroup}`);
+  console.log(`新增节点: ${transformed.addedNodeNames.join(",")}`);
+}
+
 const command = process.argv[2] || "start";
 
 async function main() {
@@ -845,15 +400,7 @@ async function main() {
       process.exit(1);
     }
     try {
-      const cfg = createRuntimeConfig();
-      const source = fs.readFileSync(inputPath, "utf8");
-      const transformed = transformYaml(source, {
-        proxy: cfg.proxy,
-        newNodeName: cfg.newNodeName,
-      });
-      fs.writeFileSync(outputPath, transformed.body, "utf8");
-      console.log(`本地改写完成: ${outputPath}`);
-      console.log(`dialer-proxy 使用代理组: ${transformed.dialerGroup}`);
+      await testTransformLocal(inputPath, outputPath);
       return;
     } catch (error) {
       console.error(`失败: ${error.message || String(error)}`);
@@ -862,7 +409,7 @@ async function main() {
   }
 
   if (command === "start") {
-    try { 
+    try {
       await startServer();
       return;
     } catch (error) {
@@ -893,7 +440,7 @@ async function main() {
 
   if (command === "link") {
     try {
-      await showLink();
+      await showLinks();
       return;
     } catch (error) {
       console.error(`输出链接失败: ${error.message || String(error)}`);
@@ -906,8 +453,3 @@ async function main() {
 }
 
 main();
-
-module.exports = {
-  transformYaml,
-  detectDialerGroup,
-};
