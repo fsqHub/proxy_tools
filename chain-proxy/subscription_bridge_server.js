@@ -107,6 +107,160 @@ function parseProxyInfo(raw) {
   return { ip, port, username, password };
 }
 
+function stripBom(text) {
+  if (!text) {
+    return text;
+  }
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+function isTopLevelKeyLine(line, key) {
+  const withoutBom = line.replace(/^\uFEFF/, "");
+  if (/^\s/.test(withoutBom)) {
+    return false;
+  }
+  return new RegExp(`^${key}:\\s*$`).test(withoutBom);
+}
+
+function looksLikeClashYamlText(text) {
+  const normalized = stripBom(text || "").replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  const hasProxies = lines.some((line) => isTopLevelKeyLine(line, "proxies"));
+  const hasProxyGroups = lines.some((line) => isTopLevelKeyLine(line, "proxy-groups"));
+  return hasProxies && hasProxyGroups;
+}
+
+function safeDecodeURIComponent(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+function tryDecodeBase64(text) {
+  const compact = (text || "").trim().replace(/\s+/g, "");
+  if (compact.length < 32) {
+    return "";
+  }
+  if (!/^[A-Za-z0-9+/_=-]+$/.test(compact)) {
+    return "";
+  }
+  const normalized = compact.replace(/-/g, "+").replace(/_/g, "/");
+  try {
+    const decoded = Buffer.from(normalized, "base64").toString("utf8");
+    if (!decoded || /[\x00-\x08\x0E-\x1F]/.test(decoded)) {
+      return "";
+    }
+    return decoded;
+  } catch {
+    return "";
+  }
+}
+
+function findClashYamlInJsonValue(value, depth = 0) {
+  if (depth > 8 || value == null) {
+    return "";
+  }
+
+  if (typeof value === "string") {
+    const candidates = [value, safeDecodeURIComponent(value), tryDecodeBase64(value)];
+    for (const c of candidates) {
+      if (c && looksLikeClashYamlText(c)) {
+        return stripBom(c);
+      }
+    }
+    for (const c of candidates) {
+      if (!c) {
+        continue;
+      }
+      const t = c.trim();
+      if (!(t.startsWith("{") || t.startsWith("["))) {
+        continue;
+      }
+      try {
+        const nested = JSON.parse(t);
+        const nestedYaml = findClashYamlInJsonValue(nested, depth + 1);
+        if (nestedYaml) {
+          return nestedYaml;
+        }
+      } catch {
+        // ignore invalid nested json
+      }
+    }
+    return "";
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const yaml = findClashYamlInJsonValue(item, depth + 1);
+      if (yaml) {
+        return yaml;
+      }
+    }
+    return "";
+  }
+
+  if (typeof value === "object") {
+    const preferredKeys = ["clash", "yaml", "config", "content", "data", "result", "payload", "body"];
+    for (const k of preferredKeys) {
+      if (Object.prototype.hasOwnProperty.call(value, k)) {
+        const yaml = findClashYamlInJsonValue(value[k], depth + 1);
+        if (yaml) {
+          return yaml;
+        }
+      }
+    }
+    for (const k of Object.keys(value)) {
+      if (preferredKeys.includes(k)) {
+        continue;
+      }
+      const yaml = findClashYamlInJsonValue(value[k], depth + 1);
+      if (yaml) {
+        return yaml;
+      }
+    }
+  }
+
+  return "";
+}
+
+function extractClashYaml(rawText) {
+  const raw = stripBom(rawText || "");
+  if (looksLikeClashYamlText(raw)) {
+    return { yaml: raw, mode: "direct_yaml" };
+  }
+
+  const decodedUrl = safeDecodeURIComponent(raw);
+  if (decodedUrl !== raw && looksLikeClashYamlText(decodedUrl)) {
+    return { yaml: stripBom(decodedUrl), mode: "url_decoded_yaml" };
+  }
+
+  const decodedB64 = tryDecodeBase64(raw);
+  if (decodedB64 && looksLikeClashYamlText(decodedB64)) {
+    return { yaml: stripBom(decodedB64), mode: "base64_yaml" };
+  }
+
+  const jsonCandidates = [raw, decodedUrl, decodedB64].filter(Boolean);
+  for (const candidate of jsonCandidates) {
+    const t = candidate.trim();
+    if (!(t.startsWith("{") || t.startsWith("["))) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(t);
+      const yaml = findClashYamlInJsonValue(parsed);
+      if (yaml) {
+        return { yaml, mode: "json_wrapped_yaml" };
+      }
+    } catch {
+      // ignore invalid json
+    }
+  }
+
+  return null;
+}
+
 function detectDialerGroup(lines) {
   let inGroups = false;
   let currentName = "";
@@ -114,7 +268,7 @@ function detectDialerGroup(lines) {
   let byType = "";
 
   for (const line of lines) {
-    if (/^proxy-groups:\s*$/.test(line)) {
+    if (isTopLevelKeyLine(line, "proxy-groups")) {
       inGroups = true;
       continue;
     }
@@ -168,11 +322,12 @@ function hasSshDirectRule(lines) {
 }
 
 function transformYaml(sourceText, config) {
-  const hasTrailingNewline = sourceText.endsWith("\n");
-  const lines = sourceText.replace(/\r\n/g, "\n").split("\n");
+  const normalizedSource = stripBom(sourceText || "");
+  const hasTrailingNewline = normalizedSource.endsWith("\n");
+  const lines = normalizedSource.replace(/\r\n/g, "\n").split("\n");
 
-  const hasProxies = lines.some((line) => /^proxies:\s*$/.test(line));
-  const hasProxyGroups = lines.some((line) => /^proxy-groups:\s*$/.test(line));
+  const hasProxies = lines.some((line) => isTopLevelKeyLine(line, "proxies"));
+  const hasProxyGroups = lines.some((line) => isTopLevelKeyLine(line, "proxy-groups"));
   if (!hasProxies) {
     fail("订阅内容中未找到 proxies 段");
   }
@@ -200,7 +355,7 @@ function transformYaml(sourceText, config) {
   let inFirstGroup = false;
 
   for (const line of lines) {
-    if (!insertedSshDirectRule && /^rules:\s*$/.test(line)) {
+    if (!insertedSshDirectRule && isTopLevelKeyLine(line, "rules")) {
       inRules = true;
       out.push(line);
       out.push("  - DST-PORT,22,DIRECT");
@@ -212,7 +367,7 @@ function transformYaml(sourceText, config) {
       inRules = false;
     }
 
-    if (!insertedProxyNode && /^proxies:\s*$/.test(line)) {
+    if (!insertedProxyNode && isTopLevelKeyLine(line, "proxies")) {
       out.push(line);
       out.push(`  - name: ${config.newNodeName}`);
       out.push("    type: socks5");
@@ -225,7 +380,7 @@ function transformYaml(sourceText, config) {
       continue;
     }
 
-    if (/^proxy-groups:\s*$/.test(line)) {
+    if (isTopLevelKeyLine(line, "proxy-groups")) {
       inGroups = true;
     } else if (inGroups && /^[^\s]/.test(line)) {
       if (inFirstGroup && !insertedFirstGroupRef) {
@@ -539,7 +694,14 @@ async function handleSubscriptionRequest(req, res, cfg) {
     }
 
     const source = await fetchTextWithTimeout(cfg.subscriptionUrlA, cfg.fetchTimeoutMs, headers, "拉取订阅 A 失败");
-    const transformed = transformYaml(source, {
+    const extracted = extractClashYaml(source);
+    if (!extracted) {
+      const snippet = stripBom(source || "").replace(/\s+/g, " ").slice(0, 200);
+      fail(`上游响应无法识别为 Clash YAML（可能是 JSON/HTML/链接文本），片段: ${snippet}`);
+    }
+    logInfo(`上游订阅解析模式: ${extracted.mode}`);
+
+    const transformed = transformYaml(extracted.yaml, {
       proxy: cfg.proxy,
       newNodeName: cfg.newNodeName,
     });
