@@ -7,6 +7,13 @@ const http = require("node:http");
 const path = require("node:path");
 const { URL } = require("node:url");
 
+const SCRIPT_FILE = path.basename(__filename);
+const SCRIPT_STEM = SCRIPT_FILE.replace(/\.[^.]+$/, "");
+const SELF_NODE_CMD = `node "${SCRIPT_FILE}"`;
+function selfNodeCommand(args = "") {
+  return args ? `${SELF_NODE_CMD} ${args}` : SELF_NODE_CMD;
+}
+
 /*
 作用:
 1) 提供一个可供 Clash 导入/更新的订阅链接 B（默认路径 /sub）。
@@ -17,17 +24,17 @@ const { URL } = require("node:url");
 使用方法:
 1) 先填写下面“用户手动填写”区域。
 2) 启动服务:
-   - 前台运行: node subscription_bridge_server.js start
-   - 后台运行: nohup node subscription_bridge_server.js start > bridge.log 2>&1 &
+   - 前台运行: node <脚本名>.js start
+   - 后台运行: nohup node <脚本名>.js start > bridge.log 2>&1 &
    - 前台和后台都会输出日志，且同时写入 LOG_FILE 指定文件
    - 当 PUBLIC_BASE_URL 为空时，会自动探测公网 IP 并用于订阅链接 B
 3) 在 Clash 中导入脚本启动日志里输出的“订阅链接 B”。
-4) 查看状态: node subscription_bridge_server.js status
-5) 停止服务: node subscription_bridge_server.js stop
+4) 查看状态: node <脚本名>.js status
+5) 停止服务: node <脚本名>.js stop
 
 停止进程:
 1) 启动该进程的同一终端: Ctrl + C
-2) 任意终端: node subscription_bridge_server.js stop
+2) 任意终端: node <脚本名>.js stop
 */
 
 // ===== 用户手动填写 =====
@@ -54,9 +61,9 @@ const PUBLIC_IP_DETECT_TIMEOUT_MS = 3500;
 // 可选：上游订阅 A 需要 Authorization 时填写，例如 "Bearer xxx"
 const UPSTREAM_AUTH_HEADER = "";
 // 服务 PID 文件路径（用于 stop/status）
-const PID_FILE = path.resolve(__dirname, "subscription_bridge_server.pid");
+const PID_FILE = path.resolve(__dirname, `${SCRIPT_STEM}.pid`);
 // 服务日志文件路径（所有日志统一写入此文件）
-const LOG_FILE = path.resolve(__dirname, "subscription_bridge_server.log");
+const LOG_FILE = path.resolve(__dirname, `${SCRIPT_STEM}.log`);
 // ======================
 
 function fail(message) {
@@ -505,7 +512,7 @@ function removePidFileIfOwned(pidFile, expectedPid) {
 function saveCurrentPid(pidFile) {
   const existingPid = readPidFile(pidFile);
   if (existingPid && isProcessRunning(existingPid)) {
-    fail(`服务已在运行，PID=${existingPid}，如需停止请执行: node subscription_bridge_server.js stop`);
+    fail(`服务已在运行，PID=${existingPid}，如需停止请执行: ${selfNodeCommand("stop")}`);
   }
   if (existingPid && !isProcessRunning(existingPid) && fs.existsSync(pidFile)) {
     fs.unlinkSync(pidFile);
@@ -761,8 +768,8 @@ async function startServer() {
     logInfo(`订阅链接 B: ${subscriptionLink}`);
     logInfo(`日志文件: ${LOG_FILE}`);
     logInfo(`上游订阅 A: ${cfg.subscriptionUrlA}`);
-    logInfo(`停止命令: node subscription_bridge_server.js stop`);
-    logInfo(`状态命令: node subscription_bridge_server.js status`);
+    logInfo(`停止命令: ${selfNodeCommand("stop")}`);
+    logInfo(`状态命令: ${selfNodeCommand("status")}`);
   });
 
   server.on("error", (err) => {
@@ -834,7 +841,7 @@ async function main() {
     const inputPath = process.argv[3];
     const outputPath = process.argv[4];
     if (!inputPath || !outputPath) {
-      console.error("用法: node subscription_bridge_server.js --transform-local <inputYamlPath> <outputYamlPath>");
+      console.error(`用法: ${selfNodeCommand("--transform-local <inputYamlPath> <outputYamlPath>")}`);
       process.exit(1);
     }
     try {
