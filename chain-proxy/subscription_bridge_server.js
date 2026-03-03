@@ -4,7 +4,6 @@
 
 const fs = require("node:fs");
 const http = require("node:http");
-const https = require("node:https");
 const path = require("node:path");
 const { URL } = require("node:url");
 
@@ -21,9 +20,7 @@ const { URL } = require("node:url");
    - 前台运行: node subscription_bridge_server.js start
    - 后台运行: nohup node subscription_bridge_server.js start > bridge.log 2>&1 &
    - 前台和后台都会输出日志，且同时写入 LOG_FILE 指定文件
-   - 要生成可用 https 订阅链接，二选一:
-     A. 填写 PUBLIC_BASE_URL=https://你的域名（推荐，走反向代理）
-     B. 启用 ENABLE_HTTPS_SERVER 并配置 HTTPS_CERT_FILE/HTTPS_KEY_FILE
+   - 当 PUBLIC_BASE_URL 为空时，会自动探测公网 IP 并用于订阅链接 B
 3) 在 Clash 中导入脚本启动日志里输出的“订阅链接 B”。
 4) 查看状态: node subscription_bridge_server.js status
 5) 停止服务: node subscription_bridge_server.js stop
@@ -45,15 +42,9 @@ const HOST = "0.0.0.0";
 const PORT = 8090;
 // B 订阅路径，例如 /sub
 const B_PATH = "/sub";
-// 可选：对外访问 B 的基础地址（必须是 https://），例如 https://sub.example.com
-// 若已通过 Nginx/Caddy 反代到本服务，建议优先填写此项。
+// 可选：对外访问 B 的基础地址（建议远程服务器填写域名，如 https://sub.example.com）
+// 留空时会自动探测远程主机公网 IP 来生成订阅链接
 const PUBLIC_BASE_URL = "";
-// 是否由脚本本身启用 HTTPS（不依赖反向代理）
-const ENABLE_HTTPS_SERVER = false;
-// HTTPS 证书文件路径（PEM），ENABLE_HTTPS_SERVER=true 时必填
-const HTTPS_CERT_FILE = "";
-// HTTPS 私钥文件路径（PEM），ENABLE_HTTPS_SERVER=true 时必填
-const HTTPS_KEY_FILE = "";
 // 可选：B 订阅访问令牌（留空表示不鉴权）
 const B_TOKEN = "";
 // 可选：拉取 A 的超时时间（毫秒）
@@ -430,13 +421,6 @@ async function resolveSubscriptionLink(cfg, options = {}) {
     return `${base}${normalizedPath}${tokenHint}`;
   }
 
-  if (!cfg.enableHttpsServer) {
-    if (options.allowPlaceholder) {
-      return "(未配置 PUBLIC_BASE_URL，且未启用本地 HTTPS 服务)";
-    }
-    fail("无法生成可用 HTTPS 链接：请设置 PUBLIC_BASE_URL=https://你的域名，或启用 ENABLE_HTTPS_SERVER 并配置证书");
-  }
-
   let hostForLink = cfg.host;
   if (isWildcardListenHost(cfg.host)) {
     const publicIp = await detectPublicIp(cfg.publicIpDetectTimeoutMs);
@@ -444,13 +428,12 @@ async function resolveSubscriptionLink(cfg, options = {}) {
       if (options.allowPlaceholder) {
         return "(无法自动探测公网IP，请设置 PUBLIC_BASE_URL)";
       }
-      fail("无法自动探测公网IP，请设置 PUBLIC_BASE_URL（例如 https://你的域名）");
+      fail("无法自动探测公网IP，请设置 PUBLIC_BASE_URL（例如 http://你的公网IP:8090）");
     }
     hostForLink = publicIp;
   }
 
-  const portSuffix = cfg.port === 443 ? "" : `:${cfg.port}`;
-  return `https://${hostForLink}${portSuffix}${normalizedPath}${tokenHint}`;
+  return `http://${hostForLink}:${cfg.port}${normalizedPath}${tokenHint}`;
 }
 
 function createRuntimeConfig() {
@@ -461,9 +444,6 @@ function createRuntimeConfig() {
   const port = Number(PORT);
   const bPath = B_PATH;
   const publicBaseUrl = PUBLIC_BASE_URL.trim();
-  const enableHttpsServer = ENABLE_HTTPS_SERVER;
-  const httpsCertFile = HTTPS_CERT_FILE;
-  const httpsKeyFile = HTTPS_KEY_FILE;
   const bToken = B_TOKEN;
   const fetchTimeoutMs = Number(FETCH_TIMEOUT_MS);
   const publicIpDetectTimeoutMs = Number(PUBLIC_IP_DETECT_TIMEOUT_MS);
@@ -482,22 +462,8 @@ function createRuntimeConfig() {
   if (!bPath.startsWith("/")) {
     fail("B_PATH 必须以 / 开头，例如 /sub");
   }
-  if (publicBaseUrl && !/^https:\/\//.test(publicBaseUrl)) {
-    fail("PUBLIC_BASE_URL 必须是 https 链接，或留空");
-  }
-  if (typeof enableHttpsServer !== "boolean") {
-    fail("ENABLE_HTTPS_SERVER 必须是 true 或 false");
-  }
-  if (enableHttpsServer && (!httpsCertFile || !httpsKeyFile)) {
-    fail("启用 ENABLE_HTTPS_SERVER 时必须填写 HTTPS_CERT_FILE 和 HTTPS_KEY_FILE");
-  }
-  if (enableHttpsServer) {
-    if (!fs.existsSync(httpsCertFile)) {
-      fail(`HTTPS_CERT_FILE 不存在: ${httpsCertFile}`);
-    }
-    if (!fs.existsSync(httpsKeyFile)) {
-      fail(`HTTPS_KEY_FILE 不存在: ${httpsKeyFile}`);
-    }
+  if (publicBaseUrl && !/^https?:\/\//.test(publicBaseUrl)) {
+    fail("PUBLIC_BASE_URL 必须是 http/https 链接，或留空");
   }
   if (!Number.isFinite(fetchTimeoutMs) || fetchTimeoutMs < 1000) {
     fail("FETCH_TIMEOUT_MS 不能小于 1000");
@@ -520,9 +486,6 @@ function createRuntimeConfig() {
     port,
     bPath,
     publicBaseUrl,
-    enableHttpsServer,
-    httpsCertFile,
-    httpsKeyFile,
     bToken,
     fetchTimeoutMs,
     publicIpDetectTimeoutMs,
@@ -603,18 +566,9 @@ async function startServer() {
 
   let stopping = false;
 
-  const handler = (req, res) => {
+  const server = http.createServer((req, res) => {
     handleSubscriptionRequest(req, res, cfg);
-  };
-  const server = cfg.enableHttpsServer
-    ? https.createServer(
-        {
-          cert: fs.readFileSync(cfg.httpsCertFile, "utf8"),
-          key: fs.readFileSync(cfg.httpsKeyFile, "utf8"),
-        },
-        handler
-      )
-    : http.createServer(handler);
+  });
 
   const shutdown = (signalName) => {
     if (stopping) {
@@ -642,7 +596,6 @@ async function startServer() {
   server.listen(cfg.port, cfg.host, () => {
     logInfo(`进程 PID: ${process.pid}`);
     logInfo("订阅中转服务已启动");
-    logInfo(`监听协议: ${cfg.enableHttpsServer ? "https" : "http"}`);
     logInfo(`订阅链接 B: ${subscriptionLink}`);
     logInfo(`日志文件: ${LOG_FILE}`);
     logInfo(`上游订阅 A: ${cfg.subscriptionUrlA}`);
