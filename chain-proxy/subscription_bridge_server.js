@@ -55,7 +55,8 @@ const UPSTREAM_AUTH_HEADER = "";
 const PRECHECK_ON_START = true;
 
 const PID_FILE = path.resolve(__dirname, `${SCRIPT_STEM}.pid`);
-const LOG_FILE = path.resolve(__dirname, `${SCRIPT_STEM}.log`);
+const LOG_DIR = path.resolve(__dirname, "logs");
+const LOG_FILE = path.resolve(LOG_DIR, `${SCRIPT_STEM}.log`);
 // ======================
 
 function fail(message) {
@@ -139,6 +140,7 @@ function createRuntimeConfig() {
   if (!LOG_FILE) {
     fail("LOG_FILE 不能为空");
   }
+  fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
 
   return {
     subscriptionCsvFile: SUBSCRIPTION_CSV_FILE,
