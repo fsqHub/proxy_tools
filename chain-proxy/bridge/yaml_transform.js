@@ -247,6 +247,8 @@ function transformYaml(sourceText, proxyNodes) {
   for (const line of lines) {
     if (!insertedSshDirectRule && isTopLevelKeyLine(line, "rules")) {
       inRules = true;
+      inGroups = false;
+      inFirstGroup = false;
       // 检测 rules 块中下一行的缩进
       const nextIdx = lines.indexOf(line) + 1;
       let indent = "    ";
@@ -326,6 +328,7 @@ function transformYaml(sourceText, proxyNodes) {
             out.push(`      - ${n}`);
           }
         }
+        insertedFirstGroupRef = true;
         continue;
       }
     }
