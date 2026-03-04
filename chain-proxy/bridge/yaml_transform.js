@@ -14,6 +14,54 @@ function stripWrappedQuotes(value) {
   return v;
 }
 
+/**
+ * 从 flow-style 行（如 `  - { name: XX, type: YY, ... }`）中提取指定字段。
+ * 返回字段值或空字符串。
+ */
+function extractFlowField(line, field) {
+  // 匹配 field: value 或 field: 'value' 或 field: "value"
+  const re = new RegExp(`[{,]\\s*${field}:\\s*([^,}]+)`);
+  const m = line.match(re);
+  if (!m) {
+    return "";
+  }
+  return stripWrappedQuotes(m[1]);
+}
+
+/**
+ * 判断一行是否是 proxy-groups 段内的列表项。
+ * 支持 block-style (`  - name: XX`) 和 flow-style (`  - { name: XX, ... }`)。
+ */
+function isGroupItemLine(line) {
+  return /^\s+- name:\s*/.test(line) || /^\s+-\s*\{.*name:/.test(line);
+}
+
+/**
+ * 从一行中提取 proxy-group 的 name。
+ * 支持 block-style 和 flow-style。
+ */
+function extractGroupName(line) {
+  // block-style: `  - name: XX`
+  if (/^\s+- name:\s*/.test(line) && !/\{/.test(line)) {
+    return stripWrappedQuotes(line.replace(/^\s+- name:\s*/, ""));
+  }
+  // flow-style: `  - { name: XX, ... }`
+  return extractFlowField(line, "name");
+}
+
+/**
+ * 从一行中提取 proxy-group 的 type。
+ * block-style 的 type 在单独一行上，flow-style 在同一行。
+ */
+function extractGroupType(line) {
+  // block-style: `    type: XX`
+  if (/^\s+type:\s*/.test(line) && !/\{/.test(line)) {
+    return stripWrappedQuotes(line.replace(/^\s+type:\s*/, ""));
+  }
+  // flow-style: `  - { name: XX, type: YY, ... }`
+  return extractFlowField(line, "type");
+}
+
 function detectDialerGroup(lines) {
   let inGroups = false;
   let currentName = "";
@@ -32,15 +80,32 @@ function detectDialerGroup(lines) {
       continue;
     }
 
-    if (/^  - name:\s*/.test(line)) {
-      currentName = stripWrappedQuotes(line.replace(/^  - name:\s*/, ""));
+    // flow-style 行：name 和 type 都在同一行
+    if (/^\s+-\s*\{.*name:/.test(line)) {
+      const name = extractFlowField(line, "name");
+      const type = extractFlowField(line, "type");
+      if (name) {
+        if (!byName && name.includes("自动选择")) {
+          byName = name;
+        }
+        if (!byType && (type === "url-test" || type === "fallback" || type === "load-balance")) {
+          byType = name;
+        }
+      }
+      continue;
+    }
+
+    // block-style: `  - name: XX`
+    if (/^\s+- name:\s*/.test(line)) {
+      currentName = stripWrappedQuotes(line.replace(/^\s+- name:\s*/, ""));
       if (!byName && currentName.includes("自动选择")) {
         byName = currentName;
       }
       continue;
     }
-    if (/^    type:\s*/.test(line)) {
-      const type = stripWrappedQuotes(line.replace(/^    type:\s*/, ""));
+    // block-style: `    type: XX`
+    if (/^\s+type:\s*/.test(line)) {
+      const type = stripWrappedQuotes(line.replace(/^\s+type:\s*/, ""));
       if (!byType && (type === "url-test" || type === "fallback" || type === "load-balance") && currentName) {
         byType = currentName;
       }
@@ -52,12 +117,20 @@ function detectDialerGroup(lines) {
 function collectExistingNames(lines) {
   const set = new Set();
   for (const line of lines) {
-    if (!/^  - name:\s*/.test(line)) {
+    // flow-style
+    if (/^\s+-\s*\{.*name:/.test(line)) {
+      const name = extractFlowField(line, "name");
+      if (name) {
+        set.add(name);
+      }
       continue;
     }
-    const name = stripWrappedQuotes(line.replace(/^  - name:\s*/, ""));
-    if (name) {
-      set.add(name);
+    // block-style
+    if (/^\s+- name:\s*/.test(line)) {
+      const name = stripWrappedQuotes(line.replace(/^\s+- name:\s*/, ""));
+      if (name) {
+        set.add(name);
+      }
     }
   }
   return set;
@@ -71,6 +144,30 @@ function hasSshDirectRule(lines) {
     }
   }
   return false;
+}
+
+/**
+ * 将新节点名称注入到 flow-style 行的 proxies: [...] 数组头部。
+ * 例如: `{ name: X, proxies: [A, B] }` → `{ name: X, proxies: [New1, New2, A, B] }`
+ */
+function injectNamesIntoFlowProxies(line, names) {
+  const idx = line.indexOf("proxies:");
+  if (idx === -1) {
+    return line;
+  }
+  const afterKey = line.indexOf("[", idx);
+  if (afterKey === -1) {
+    return line;
+  }
+  const prefix = names.map((n) => n).join(", ");
+  // 插入到 [ 之后
+  const beforeBracket = line.slice(0, afterKey + 1);
+  const afterBracket = line.slice(afterKey + 1).trimStart();
+  if (afterBracket.startsWith("]")) {
+    // 空数组
+    return `${beforeBracket}${prefix}${afterBracket}`;
+  }
+  return `${beforeBracket}${prefix}, ${afterBracket}`;
 }
 
 function buildProxyYamlLines(node, dialerProxy) {
@@ -191,10 +288,21 @@ function transformYaml(sourceText, proxyNodes) {
     }
 
     if (inGroups) {
-      if (!seenFirstGroup && /^  - name:\s*/.test(line)) {
+      const isFlowGroupItem = /^\s+-\s*\{.*name:/.test(line);
+      const isBlockGroupItem = /^\s+- name:\s*/.test(line) && !isFlowGroupItem;
+
+      if (!seenFirstGroup && (isBlockGroupItem || isFlowGroupItem)) {
         seenFirstGroup = true;
         inFirstGroup = true;
-      } else if (seenFirstGroup && inFirstGroup && /^  - name:\s*/.test(line)) {
+
+        // flow-style: 第一个 group 整行，直接注入 proxies
+        if (isFlowGroupItem && !insertedFirstGroupRef) {
+          out.push(injectNamesIntoFlowProxies(line, allNewNames));
+          insertedFirstGroupRef = true;
+          continue;
+        }
+      } else if (seenFirstGroup && inFirstGroup && (isBlockGroupItem || isFlowGroupItem)) {
+        // 遇到第二个 group，说明第一个 group 的 block-style 没有 proxies 段
         if (!insertedFirstGroupRef) {
           out.push("    proxies:");
           for (const n of allNewNames) {
@@ -203,9 +311,16 @@ function transformYaml(sourceText, proxyNodes) {
           insertedFirstGroupRef = true;
         }
         inFirstGroup = false;
+
+        // 如果第二个 group 也是 flow-style，注入新名称
+        if (isFlowGroupItem) {
+          out.push(injectNamesIntoFlowProxies(line, allNewNames));
+          continue;
+        }
       }
 
-      if (inFirstGroup && !insertedFirstGroupRef && /^    proxies:\s*$/.test(line)) {
+      // block-style: proxies: 行后注入
+      if (inFirstGroup && !insertedFirstGroupRef && /^\s+proxies:\s*$/.test(line)) {
         out.push(line);
         for (const n of allNewNames) {
           out.push(`      - ${n}`);
