@@ -274,14 +274,34 @@ async function startServer() {
       }
 
       const source = await fetchTextWithTimeout(sub.aUrl, cfg.fetchTimeoutMs, headers, `拉取订阅 A(${sub.id}) 失败`);
-      const extracted = extractClashYaml(source);
+
+      // 加载模板文件（如果配置了）
+      let templateYaml = "";
+      if (sub.template && sub.template.toLowerCase() !== "none") {
+        // subscription_bridge_server.js 在服务根目录，不需要跳到上一级(..)
+        const templatePath = path.resolve(__dirname, sub.template);
+        if (fs.existsSync(templatePath)) {
+          templateYaml = fs.readFileSync(templatePath, "utf8");
+        }
+      }
+
+      const extracted = extractClashYaml(source, templateYaml);
       if (!extracted) {
         const snippet = stripBom(source || "").replace(/\s+/g, " ").slice(0, 200);
         fail(`上游响应无法识别为 Clash YAML（id=${sub.id}），片段: ${snippet}`);
       }
 
       const transformed = transformYaml(extracted.yaml, registry.proxyNodes);
-      detail = `ok id=${sub.id} mode=${extracted.mode} dialer=${transformed.dialerGroup} added=${transformed.addedNodeNames.length}`;
+
+      // 保存生成的配置文件
+      const outputPath = path.resolve(__dirname, "output");
+      if (!fs.existsSync(outputPath)) {
+        fs.mkdirSync(outputPath, { recursive: true });
+      }
+      const savedFilePath = path.join(outputPath, `sub_${sub.id}.yaml`);
+      fs.writeFileSync(savedFilePath, transformed.body, "utf8");
+
+      detail = `ok id=${sub.id} mode=${extracted.mode} dialer=${transformed.dialerGroup} added=${transformed.addedNodeNames.length} savedTo=${savedFilePath}`;
 
       reply(200, transformed.body, {
         "content-type": "application/yaml; charset=utf-8",

@@ -1,6 +1,6 @@
 "use strict";
 
-const { looksLikeV2rayLinks, v2rayLinksToClashYaml } = require("./v2ray_converter");
+const { looksLikeV2rayLinks, v2rayLinksToClashYaml, mergeV2rayNodesIntoTemplate } = require("./v2ray_converter");
 
 function fail(message) {
   throw new Error(message);
@@ -124,7 +124,7 @@ function findClashYamlInJsonValue(value, depth = 0) {
   return "";
 }
 
-function extractClashYaml(rawText) {
+function extractClashYaml(rawText, templateYaml) {
   const raw = stripBom(rawText || "");
   if (looksLikeClashYamlText(raw)) {
     return { yaml: raw, mode: "direct_yaml" };
@@ -161,6 +161,17 @@ function extractClashYaml(rawText) {
   const v2rayCandidates = [raw, decodedUrl, decodedB64].filter(Boolean);
   for (const candidate of v2rayCandidates) {
     if (looksLikeV2rayLinks(candidate)) {
+      // 如果提供了模板，提取 v2ray 转化出的 proxies 和 proxy-groups 整体结构注入到模板中
+      if (templateYaml) {
+        const v2rayYaml = v2rayLinksToClashYaml(candidate);
+        if (v2rayYaml) {
+          const merged = mergeV2rayNodesIntoTemplate(templateYaml, v2rayYaml);
+          if (merged) {
+            return { yaml: merged, mode: "v2ray_template_merged" };
+          }
+        }
+      }
+      // 无模板时生成最小化 Clash YAML
       const yaml = v2rayLinksToClashYaml(candidate);
       if (yaml) {
         return { yaml, mode: "v2ray_converted" };

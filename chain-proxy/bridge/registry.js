@@ -13,8 +13,19 @@ async function validateSubscriptionRow(sub, cfg, proxyNodes) {
     headers.authorization = cfg.upstreamAuthHeader;
   }
 
+  let templateYaml = "";
+  if (sub.template && sub.template.toLowerCase() !== "none") {
+    const fs = require("node:fs");
+    const path = require("node:path");
+    // registry.js 位于 bridge 目录下，所以跳到上层然后基于服务根目录解析
+    const templatePath = path.resolve(__dirname, "..", sub.template);
+    if (fs.existsSync(templatePath)) {
+      templateYaml = fs.readFileSync(templatePath, "utf8");
+    }
+  }
+
   const source = await fetchTextWithTimeout(sub.aUrl, cfg.fetchTimeoutMs, headers, `预检拉取订阅 A(${sub.id}) 失败`);
-  const extracted = extractClashYaml(source);
+  const extracted = extractClashYaml(source, templateYaml);
   if (!extracted) {
     const snippet = stripBom(source || "").replace(/\s+/g, " ").slice(0, 200);
     throw new Error(`预检解析失败: 无法识别为 Clash YAML，片段: ${snippet}`);
@@ -25,11 +36,22 @@ async function validateSubscriptionRow(sub, cfg, proxyNodes) {
     throw new Error("预检改写失败: 没有成功加入任何链式代理节点");
   }
 
+  // 保存生成的预热配置文件
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const outputPath = path.resolve(__dirname, "..", "output");
+  if (!fs.existsSync(outputPath)) {
+    fs.mkdirSync(outputPath, { recursive: true });
+  }
+  const savedFilePath = path.join(outputPath, `sub_${sub.id}.yaml`);
+  fs.writeFileSync(savedFilePath, transformed.body, "utf8");
+
   return {
     parseMode: extracted.mode,
     addedNodeNames: transformed.addedNodeNames,
     skippedNodeNames: transformed.skippedNodeNames,
     dialerGroup: transformed.dialerGroup,
+    savedTo: savedFilePath,
   };
 }
 
@@ -45,7 +67,7 @@ async function buildRegistry(cfg, logger) {
       if (cfg.precheckOnStart) {
         const check = await validateSubscriptionRow(sub, cfg, proxyNodes);
         logger.info(
-          `预检通过 id=${sub.id} token=${sub.token} mode=${check.parseMode} added=${check.addedNodeNames.join("|")} dialer=${check.dialerGroup}`
+          `预检通过 id=${sub.id} token=${sub.token} mode=${check.parseMode} added=${check.addedNodeNames.join("|")} dialer=${check.dialerGroup} savedTo=${check.savedTo}`
         );
       } else {
         logger.info(`跳过预检 id=${sub.id} token=${sub.token}`);

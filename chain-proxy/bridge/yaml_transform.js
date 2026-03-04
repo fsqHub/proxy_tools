@@ -247,8 +247,15 @@ function transformYaml(sourceText, proxyNodes) {
   for (const line of lines) {
     if (!insertedSshDirectRule && isTopLevelKeyLine(line, "rules")) {
       inRules = true;
+      // 检测 rules 块中下一行的缩进
+      const nextIdx = lines.indexOf(line) + 1;
+      let indent = "    ";
+      for (let j = nextIdx; j < lines.length; j++) {
+        const m = lines[j].match(/^(\s+)-/);
+        if (m) { indent = m[1]; break; }
+      }
       out.push(line);
-      out.push("  - DST-PORT,22,DIRECT");
+      out.push(`${indent}- DST-PORT,22,DIRECT`);
       insertedSshDirectRule = true;
       continue;
     }
@@ -275,57 +282,50 @@ function transformYaml(sourceText, proxyNodes) {
 
     if (isTopLevelKeyLine(line, "proxy-groups")) {
       inGroups = true;
+      out.push(line);
+      continue;
     } else if (inGroups && /^[^\s]/.test(line)) {
-      if (inFirstGroup && !insertedFirstGroupRef) {
-        out.push("    proxies:");
-        for (const n of allNewNames) {
-          out.push(`      - ${n}`);
-        }
-        insertedFirstGroupRef = true;
-      }
       inGroups = false;
-      inFirstGroup = false;
     }
 
     if (inGroups) {
       const isFlowGroupItem = /^\s+-\s*\{.*name:/.test(line);
       const isBlockGroupItem = /^\s+- name:\s*/.test(line) && !isFlowGroupItem;
 
-      if (!seenFirstGroup && (isBlockGroupItem || isFlowGroupItem)) {
-        seenFirstGroup = true;
-        inFirstGroup = true;
-
-        // flow-style: 第一个 group 整行，直接注入 proxies
-        if (isFlowGroupItem && !insertedFirstGroupRef) {
+      if (isFlowGroupItem) {
+        const name = extractFlowField(line, "name");
+        const type = extractFlowField(line, "type");
+        // 如果不是"自动选择"类分组，则注入新节点（仅按名称判断）
+        if (name && !name.includes("自动选择")) {
           out.push(injectNamesIntoFlowProxies(line, allNewNames));
-          insertedFirstGroupRef = true;
           continue;
         }
-      } else if (seenFirstGroup && inFirstGroup && (isBlockGroupItem || isFlowGroupItem)) {
-        // 遇到第二个 group，说明第一个 group 的 block-style 没有 proxies 段
-        if (!insertedFirstGroupRef) {
-          out.push("    proxies:");
+      } else if (isBlockGroupItem) {
+        // 进入一个新的 block 分组
+        const currentName = stripWrappedQuotes(line.replace(/^\s+- name:\s*/, ""));
+        inFirstGroup = !currentName.includes("自动选择"); // 复用 inFirstGroup 变量表示当前组是否为目标组
+        // 我们还需要看 type，但在这一行看不出。所以我们暂定只要名字不含自动选择就尝试进入。
+        out.push(line);
+        continue;
+      }
+
+      // block-style: 不再按 type 排除，仅在名称包含"自动选择"时排除（已在上面处理）
+
+      // block-style: proxies: 行后注入
+      if (inFirstGroup && /^\s+proxies:/.test(line)) {
+        if (line.includes("[]")) {
+          out.push(line.replace("[]", `[${allNewNames.join(", ")}]`));
+        } else if (line.includes("[")) {
+          // 已经有内容的 flow-style proxies 属性
+          const idx = line.indexOf("[");
+          out.push(line.slice(0, idx + 1) + allNewNames.join(", ") + ", " + line.slice(idx + 1));
+        } else {
+          // 纯 block-style 的 proxies: 标题
+          out.push(line);
           for (const n of allNewNames) {
             out.push(`      - ${n}`);
           }
-          insertedFirstGroupRef = true;
         }
-        inFirstGroup = false;
-
-        // 如果第二个 group 也是 flow-style，注入新名称
-        if (isFlowGroupItem) {
-          out.push(injectNamesIntoFlowProxies(line, allNewNames));
-          continue;
-        }
-      }
-
-      // block-style: proxies: 行后注入
-      if (inFirstGroup && !insertedFirstGroupRef && /^\s+proxies:\s*$/.test(line)) {
-        out.push(line);
-        for (const n of allNewNames) {
-          out.push(`      - ${n}`);
-        }
-        insertedFirstGroupRef = true;
         continue;
       }
     }
@@ -343,12 +343,12 @@ function transformYaml(sourceText, proxyNodes) {
 
   if (!insertedSshDirectRule) {
     out.push("rules:");
-    out.push("  - DST-PORT,22,DIRECT");
+    out.push("    - DST-PORT,22,DIRECT");
     insertedSshDirectRule = true;
   }
 
-  if (!insertedProxyNodes || !insertedFirstGroupRef || !insertedSshDirectRule) {
-    fail("生成新 YAML 失败（可能未正确识别 proxies 或第一个 proxy-group）");
+  if (!insertedProxyNodes || !insertedSshDirectRule) {
+    fail("生成新 YAML 失败（可能未正确识别 proxies 或 rules 块）");
   }
 
   const body = out.join("\n");

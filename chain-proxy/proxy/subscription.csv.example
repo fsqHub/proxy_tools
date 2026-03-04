@@ -1,4 +1,4 @@
-# id,a_url,b_token,enabled
-A1,https://example.com/subscription-a1.yaml,token-a1,1
-A2,https://example.com/subscription-a2.yaml,token-a2,1
-A3,https://example.com/subscription-a3.yaml,token-a3,1
+# id,a_url,b_token,template,enabled
+A1,https://example.com/subscription-a1.yaml,token-a1,none,1
+A2,https://example.com/subscription-a2.yaml,token-a2,/path/to/template,1
+A3,https://example.com/subscription-a3.yaml,token-a3,/path/to/template,1

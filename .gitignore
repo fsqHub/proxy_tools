@@ -3,3 +3,7 @@ chain-proxy/roxy.yaml
 .marscode/deviceInfo.json
 chain-proxy/subscription_bridge_server.log
 chain-proxy/logs/subscription_bridge_server.log
+chain-proxy/output
+chain-proxy/template/examples
+chain-proxy/template/oneyuan.yaml
+chain-proxy/function.md

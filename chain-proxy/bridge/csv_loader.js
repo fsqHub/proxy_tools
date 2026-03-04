@@ -110,6 +110,7 @@ function loadSubscriptionsCsv(filePath) {
     const aUrl = pick(row, ["a_url", "subscription_url", "url", "a"]);
     const token = pick(row, ["b_token", "token", "btoken"]);
     const enabled = parseBoolean(pick(row, ["enabled"]), true);
+    const template = pick(row, ["template"]);
 
     if (!aUrl) {
       fail(`subscription.csv 第 ${lineNo} 行缺少 A 订阅链接（a_url/subscription_url/url）`);
@@ -130,6 +131,7 @@ function loadSubscriptionsCsv(filePath) {
       aUrl,
       token,
       enabled,
+      template,
       lineNo,
     });
   }

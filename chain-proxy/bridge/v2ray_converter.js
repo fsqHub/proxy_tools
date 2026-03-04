@@ -355,11 +355,11 @@ function nodeToClashLine(node) {
 }
 
 /**
- * 将 v2ray 链接文本转换为 Clash YAML 字符串
- * @param {string} linksText - 多行 v2ray 链接文本（已解码）
- * @returns {string|null} Clash YAML 字符串，解析失败返回 null
+ * 解析 v2ray 链接文本，返回节点对象数组和 Clash YAML 行
+ * @param {string} linksText - 多行 v2ray 链接文本
+ * @returns {{ nodes: object[], nodeNames: string[], proxyLines: string[] } | null}
  */
-function v2rayLinksToClashYaml(linksText) {
+function parseV2rayLinks(linksText) {
     const lines = (linksText || "").split(/\r?\n/).filter((l) => l.trim());
     const nodes = [];
     const nameSet = new Set();
@@ -368,7 +368,6 @@ function v2rayLinksToClashYaml(linksText) {
         const node = parseSingleLink(line);
         if (!node) continue;
 
-        // 去重名称
         let finalName = node.name;
         let suffix = 2;
         while (nameSet.has(finalName)) {
@@ -382,8 +381,19 @@ function v2rayLinksToClashYaml(linksText) {
 
     if (nodes.length === 0) return null;
 
-    const nodeNames = nodes.map((n) => n.name);
-    const proxyLines = nodes.map((n) => nodeToClashLine(n));
+    return {
+        nodes,
+        nodeNames: nodes.map((n) => n.name),
+        proxyLines: nodes.map((n) => nodeToClashLine(n)),
+    };
+}
+
+/**
+ * 将 v2ray 链接文本转换为 Clash YAML 字符串（无模板时生成最小化配置）
+ */
+function v2rayLinksToClashYaml(linksText) {
+    const parsed = parseV2rayLinks(linksText);
+    if (!parsed) return null;
 
     const yaml = [
         "mixed-port: 7890",
@@ -391,12 +401,12 @@ function v2rayLinksToClashYaml(linksText) {
         "mode: rule",
         "log-level: info",
         "proxies:",
-        ...proxyLines,
+        ...parsed.proxyLines,
         "proxy-groups:",
         "  - name: 自动选择",
         "    type: url-test",
         "    proxies:",
-        ...nodeNames.map((n) => `      - ${n}`),
+        ...parsed.nodeNames.map((n) => `      - ${n}`),
         "    url: 'http://www.gstatic.com/generate_204'",
         "    interval: 300",
         "rules:",
@@ -407,7 +417,98 @@ function v2rayLinksToClashYaml(linksText) {
     return yaml.join("\n");
 }
 
+// ─── 模板合并 ───────────────────────────────────────────
+
+/**
+ * 将 v2ray 订阅解析出的原生节点和代理组，完整提取并填入到模板中。
+ *
+ * 合并策略：
+ *   - 从解析出的标准 Clash YAML 中结构化截取 `proxies:` 块和 `proxy-groups:` 块。
+ *   - 扫描模板 YAML，在碰到 `proxies:` 和 `proxy-groups:` 时，将其替换为提取出的原生级块。
+ *   - 模板里原有的其他内容（dns, rules 等）完全保留原样。
+ *
+ * 将 V2Ray 转换结果结构化地合并进模板。
+ * 1. 提取 V2Ray 节点块插入到模板 proxies: 段。
+ * 2. 将 V2Ray 节点名称注入到模板中所有代理组的 proxies: [] 列表中。
+ */
+function mergeV2rayNodesIntoTemplate(templateYaml, v2rayClashYaml) {
+    const tLines = (templateYaml || "").replace(/\r\n/g, "\n").split("\n");
+    const vLines = (v2rayClashYaml || "").replace(/\r\n/g, "\n").split("\n");
+
+    const vProxiesBlock = [];
+    const vNodeNames = [];
+    let state = "";
+    for (const line of vLines) {
+        if (/^proxies:\s*$/.test(line)) {
+            state = "proxies";
+            continue;
+        }
+        if (/^proxy-groups:\s*$/.test(line)) {
+            state = "groups";
+            continue;
+        }
+        if (/^[a-zA-Z]/.test(line)) {
+            state = "";
+            continue;
+        }
+
+        if (state === "proxies" && /^\s+-/.test(line)) {
+            vProxiesBlock.push(line);
+            // 提取名称用于注入代理组
+            const nameMatch = line.match(/name:\s*([^,}]+)/);
+            if (nameMatch) {
+                vNodeNames.push(nameMatch[1].trim());
+            }
+        }
+    }
+
+    const out = [];
+    let inProxyGroups = false;
+    const namesStr = vNodeNames.join(", ");
+
+    for (let i = 0; i < tLines.length; i++) {
+        const line = tLines[i];
+        const trimmed = line.replace(/^\uFEFF/, "");
+
+        if (/^proxies:\s*$/.test(trimmed)) {
+            out.push(line);
+            out.push(...vProxiesBlock);
+            continue;
+        }
+
+        if (/^proxy-groups:\s*$/.test(trimmed)) {
+            inProxyGroups = true;
+            out.push(line);
+            continue;
+        }
+
+        if (inProxyGroups) {
+            // 如果遇到下一个顶层 key，说明 proxy-groups 结束了
+            if (/^[a-zA-Z0-9_-]+:/.test(trimmed)) {
+                inProxyGroups = false;
+            } else if (vNodeNames.length > 0) {
+                // 注入节点到该组的 proxies 列表中
+                // flow-style: proxies: [...] — 追加到已有内容的末尾
+                const proxiesMatch = line.match(/proxies:\s*\[(.*?)\]/);
+                if (proxiesMatch) {
+                    const existing = proxiesMatch[1].trim();
+                    const newList = existing
+                        ? `${existing}, ${namesStr}`
+                        : namesStr;
+                    out.push(line.replace(/proxies:\s*\[.*?\]/, `proxies: [${newList}]`));
+                    continue;
+                }
+            }
+        }
+
+        out.push(line);
+    }
+
+    return out.join("\n");
+}
+
 module.exports = {
     looksLikeV2rayLinks,
     v2rayLinksToClashYaml,
+    mergeV2rayNodesIntoTemplate,
 };
