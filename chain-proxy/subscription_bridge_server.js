@@ -9,7 +9,7 @@ const { URL } = require("node:url");
 
 const { createLogger } = require("./bridge/logger");
 const { buildRegistry } = require("./bridge/registry");
-const { resolveSubscriptionLink } = require("./bridge/link_utils");
+const { resolveSubscriptionLinkDetail } = require("./bridge/link_utils");
 const { fetchTextWithTimeout, extractClashYaml, stripBom } = require("./bridge/upstream_parser");
 const { transformYaml } = require("./bridge/yaml_transform");
 
@@ -162,15 +162,22 @@ async function buildLinkRows(cfg, registry, logger, allowPlaceholderLink) {
   const activeTokenMap = new Map();
   const links = [];
   const linkFailed = [];
+  const sourceStats = new Map();
 
   for (const sub of registry.activeSubs) {
     try {
-      const link = await resolveSubscriptionLink(cfg, sub.token, { allowPlaceholder: !!allowPlaceholderLink });
-      if (!link || link.startsWith("(")) {
-        throw new Error(link || "empty_link");
+      const detail = await resolveSubscriptionLinkDetail(cfg, sub.token, { allowPlaceholder: !!allowPlaceholderLink });
+      if (!detail.link || detail.link.startsWith("(")) {
+        throw new Error(detail.link || "empty_link");
       }
-      links.push({ sub, link });
+      links.push({
+        sub,
+        link: detail.link,
+        source: detail.source,
+        host: detail.host,
+      });
       activeTokenMap.set(sub.token, sub);
+      sourceStats.set(detail.source, (sourceStats.get(detail.source) || 0) + 1);
     } catch (error) {
       linkFailed.push({
         sub,
@@ -184,7 +191,24 @@ async function buildLinkRows(cfg, registry, logger, allowPlaceholderLink) {
     activeTokenMap,
     links,
     linkFailed,
+    sourceStats,
   };
+}
+
+function formatLinkSource(source) {
+  if (source === "public_base_url") {
+    return "PUBLIC_BASE_URL";
+  }
+  if (source === "public_ip") {
+    return "public_ip";
+  }
+  if (source === "lan_ip") {
+    return "lan_ip";
+  }
+  if (source === "listen_host") {
+    return "listen_host";
+  }
+  return source || "unknown";
 }
 
 async function startServer() {
@@ -300,8 +324,17 @@ async function startServer() {
     logger.info(`日志文件: ${cfg.logFile}`);
     logger.info(`已加载代理节点数量: ${registry.proxyNodes.length}`);
     logger.info(`订阅预检: active=${registry.activeSubs.length}, skipped=${registry.skippedSubs.length}, link_failed=${linkResult.linkFailed.length}`);
+
+    if (linkResult.sourceStats.size > 0) {
+      const summary = Array.from(linkResult.sourceStats.entries())
+        .map(([source, count]) => `${formatLinkSource(source)}=${count}`)
+        .join(", ");
+      logger.info(`订阅链接地址来源统计: ${summary}`);
+    }
+
     for (const row of linkResult.links) {
-      logger.info(`订阅链接 B [id=${row.sub.id}, token=${row.sub.token}] => ${row.link}`);
+      const hostSuffix = row.host ? `, host=${row.host}` : "";
+      logger.info(`订阅链接 B [id=${row.sub.id}, token=${row.sub.token}] => ${row.link} (source=${formatLinkSource(row.source)}${hostSuffix})`);
     }
     logger.info(`停止命令: ${selfNodeCommand("stop")}`);
     logger.info(`状态命令: ${selfNodeCommand("status")}`);
@@ -353,7 +386,8 @@ async function showStatus() {
   }
   logger.info(`订阅组合: active=${registry.activeSubs.length}, skipped=${registry.skippedSubs.length}, link_failed=${linkResult.linkFailed.length}`);
   for (const row of linkResult.links) {
-    logger.info(`B [id=${row.sub.id}, token=${row.sub.token}] => ${row.link}`);
+    const hostSuffix = row.host ? `, host=${row.host}` : "";
+    logger.info(`B [id=${row.sub.id}, token=${row.sub.token}] => ${row.link} (source=${formatLinkSource(row.source)}${hostSuffix})`);
   }
 }
 

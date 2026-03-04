@@ -1,3 +1,5 @@
 logs/error-datarangers.log
 chain-proxy/roxy.yaml
 .marscode/deviceInfo.json
+chain-proxy/subscription_bridge_server.log
+chain-proxy/logs/subscription_bridge_server.log

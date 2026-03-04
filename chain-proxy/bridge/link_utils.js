@@ -1,5 +1,7 @@
 "use strict";
 
+const os = require("node:os");
+
 const { fetchTextWithTimeout } = require("./upstream_parser");
 
 function fail(message) {
@@ -34,6 +36,73 @@ function extractIpv4(text) {
   return ip;
 }
 
+function isPrivateIpv4(ip) {
+  const parts = ip.split(".").map((x) => Number(x));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
+    return false;
+  }
+  if (parts[0] === 10) {
+    return true;
+  }
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) {
+    return true;
+  }
+  if (parts[0] === 192 && parts[1] === 168) {
+    return true;
+  }
+  return false;
+}
+
+function isIpv4Family(family) {
+  return family === "IPv4" || family === 4;
+}
+
+function isVirtualOrTunnelInterface(ifName) {
+  return /^(lo|docker\d*|veth|br-|cni|flannel|kube|tun\d*|tap\d*|utun\d*|wg\d*|tailscale\d*|zt[a-z0-9]*|ppp\d*|virbr\d*|vmnet\d*)/i.test(
+    ifName || ""
+  );
+}
+
+function isPreferredLanInterface(ifName) {
+  return /^(eth|en|wl|wlan|bond)/i.test(ifName || "");
+}
+
+function detectLanIpv4() {
+  const nets = os.networkInterfaces();
+  const preferred = [];
+  const fallback = [];
+
+  for (const [ifName, items] of Object.entries(nets)) {
+    if (!Array.isArray(items)) {
+      continue;
+    }
+    if (isVirtualOrTunnelInterface(ifName)) {
+      continue;
+    }
+
+    for (const item of items) {
+      if (!item || item.internal || !isIpv4Family(item.family)) {
+        continue;
+      }
+      const ip = extractIpv4(item.address || "");
+      if (!ip) {
+        continue;
+      }
+      if (!isPrivateIpv4(ip)) {
+        continue;
+      }
+
+      if (isPreferredLanInterface(ifName)) {
+        preferred.push(ip);
+      } else {
+        fallback.push(ip);
+      }
+    }
+  }
+
+  return preferred[0] || fallback[0] || "";
+}
+
 async function detectPublicIp(timeoutMs) {
   const urls = [
     "https://api.ipify.org",
@@ -61,30 +130,55 @@ async function detectPublicIp(timeoutMs) {
 }
 
 async function resolveSubscriptionLink(cfg, token, options = {}) {
+  const detail = await resolveSubscriptionLinkDetail(cfg, token, options);
+  return detail.link;
+}
+
+async function resolveSubscriptionLinkDetail(cfg, token, options = {}) {
   const tokenHint = buildTokenHint(token);
   const normalizedPath = normalizePath(cfg.bPath);
 
   if (cfg.publicBaseUrl) {
     const base = cfg.publicBaseUrl.replace(/\/+$/, "");
-    return `${base}${normalizedPath}${tokenHint}`;
+    return {
+      link: `${base}${normalizedPath}${tokenHint}`,
+      source: "public_base_url",
+      host: "",
+    };
   }
 
   let hostForLink = cfg.host;
+  let source = "listen_host";
   if (isWildcardListenHost(cfg.host)) {
     const publicIp = await detectPublicIp(cfg.publicIpDetectTimeoutMs);
-    if (!publicIp) {
-      if (options.allowPlaceholder) {
-        return "(无法自动探测公网IP，请设置 PUBLIC_BASE_URL)";
+    if (publicIp) {
+      hostForLink = publicIp;
+      source = "public_ip";
+    } else {
+      const lanIp = detectLanIpv4();
+      if (lanIp) {
+        hostForLink = lanIp;
+        source = "lan_ip";
+      } else if (options.allowPlaceholder) {
+        return {
+          link: "(无法自动探测公网/局域网IP，请设置 PUBLIC_BASE_URL)",
+          source: "placeholder",
+          host: "",
+        };
+      } else {
+        fail("无法自动探测公网/局域网IP，请设置 PUBLIC_BASE_URL（例如 http://你的公网IP:端口）");
       }
-      fail("无法自动探测公网IP，请设置 PUBLIC_BASE_URL（例如 http://你的公网IP:端口）");
     }
-    hostForLink = publicIp;
   }
 
-  return `http://${hostForLink}:${cfg.port}${normalizedPath}${tokenHint}`;
+  return {
+    link: `http://${hostForLink}:${cfg.port}${normalizedPath}${tokenHint}`,
+    source,
+    host: hostForLink,
+  };
 }
 
 module.exports = {
   resolveSubscriptionLink,
+  resolveSubscriptionLinkDetail,
 };
-
