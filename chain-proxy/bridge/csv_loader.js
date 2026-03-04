@@ -163,6 +163,7 @@ function loadProxyCsv(filePath) {
     const portStr = pick(row, ["port"]);
     const username = pick(row, ["username", "user"]);
     const password = pick(row, ["password", "pass"]);
+    const type = pick(row, ["type"]) || "socks5";
 
     if (!name) {
       fail(`proxy.csv 第 ${lineNo} 行缺少 name`);
@@ -182,11 +183,11 @@ function loadProxyCsv(filePath) {
     if (!Number.isFinite(port) || port <= 0 || port > 65535) {
       fail(`proxy.csv 第 ${lineNo} 行端口超出范围: ${portStr}`);
     }
-    if (!username) {
-      fail(`proxy.csv 第 ${lineNo} 行缺少 username`);
+    if (type === "socks5" && !username) {
+      fail(`proxy.csv 第 ${lineNo} 行 socks5 类型缺少 username`);
     }
-    if (!password) {
-      fail(`proxy.csv 第 ${lineNo} 行缺少 password`);
+    if (type === "socks5" && !password) {
+      fail(`proxy.csv 第 ${lineNo} 行 socks5 类型缺少 password`);
     }
 
     out.push({
@@ -195,6 +196,7 @@ function loadProxyCsv(filePath) {
       port,
       username,
       password,
+      type,
       lineNo,
     });
   }

@@ -1,5 +1,7 @@
 "use strict";
 
+const { looksLikeV2rayLinks, v2rayLinksToClashYaml } = require("./v2ray_converter");
+
 function fail(message) {
   throw new Error(message);
 }
@@ -155,30 +157,64 @@ function extractClashYaml(rawText) {
     }
   }
 
+  // 尝试 v2ray 订阅格式（base64 编码的 vless/vmess/trojan/ss 链接）
+  const v2rayCandidates = [raw, decodedUrl, decodedB64].filter(Boolean);
+  for (const candidate of v2rayCandidates) {
+    if (looksLikeV2rayLinks(candidate)) {
+      const yaml = v2rayLinksToClashYaml(candidate);
+      if (yaml) {
+        return { yaml, mode: "v2ray_converted" };
+      }
+    }
+  }
+
   return null;
 }
 
 async function fetchTextWithTimeout(url, timeoutMs, headers = {}, errorPrefix = "请求失败") {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
+  const nodeHttp = require("node:http");
+  const nodeHttps = require("node:https");
+  const { URL: NodeURL } = require("node:url");
+
+  return new Promise((resolve, reject) => {
+    const parsed = new NodeURL(url);
+    const isHttps = parsed.protocol === "https:";
+    const transport = isHttps ? nodeHttps : nodeHttp;
+
+    const options = {
       method: "GET",
       headers,
-      signal: controller.signal,
+      timeout: timeoutMs,
+    };
+    // 跳过 TLS 证书验证，以支持自签名证书的 HTTPS URL
+    if (isHttps) {
+      options.rejectUnauthorized = false;
+    }
+
+    const req = transport.request(url, options, (res) => {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        req.destroy();
+        reject(new Error(`${errorPrefix}，HTTP ${res.statusCode}`));
+        return;
+      }
+      const chunks = [];
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => resolve(chunks.join("")));
+      res.on("error", (err) => reject(err));
     });
-    if (!response.ok) {
-      fail(`${errorPrefix}，HTTP ${response.status}`);
-    }
-    return await response.text();
-  } catch (error) {
-    if (error && error.name === "AbortError") {
-      fail(`${errorPrefix}，超时(${timeoutMs}ms)`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
+
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`${errorPrefix}，超时(${timeoutMs}ms)`));
+    });
+
+    req.on("error", (err) => {
+      reject(err);
+    });
+
+    req.end();
+  });
 }
 
 module.exports = {

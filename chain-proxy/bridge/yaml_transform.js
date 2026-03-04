@@ -73,6 +73,27 @@ function hasSshDirectRule(lines) {
   return false;
 }
 
+function buildProxyYamlLines(node, dialerProxy) {
+  const lines = [];
+  lines.push(`  - name: ${node.name}${dialerProxy ? "-Chain" : ""}`);
+  lines.push(`    type: ${node.type || "socks5"}`);
+  lines.push(`    server: ${node.server}`);
+  lines.push(`    port: ${node.port}`);
+  if (node.username) {
+    lines.push(`    username: ${node.username}`);
+  }
+  if (node.password) {
+    lines.push(`    password: ${node.password}`);
+  }
+  if ((node.type || "socks5") === "socks5") {
+    lines.push("    udp: true");
+  }
+  if (dialerProxy) {
+    lines.push(`    dialer-proxy: ${dialerProxy}`);
+  }
+  return lines;
+}
+
 function transformYaml(sourceText, proxyNodes) {
   const normalizedSource = stripBom(sourceText || "");
   const hasTrailingNewline = normalizedSource.endsWith("\n");
@@ -89,22 +110,31 @@ function transformYaml(sourceText, proxyNodes) {
 
   const dialerGroup = detectDialerGroup(lines);
   if (!dialerGroup) {
-    fail("未找到可用的自动选择代理组（name 包含“自动选择”或 type 为 url-test/fallback/load-balance）");
+    fail('未找到可用的自动选择代理组（name 包含"自动选择"或 type 为 url-test/fallback/load-balance）');
   }
 
   const existingNames = collectExistingNames(lines);
   const addedNodes = [];
   const skippedNodes = [];
   for (const node of proxyNodes) {
-    if (existingNames.has(node.name)) {
+    const chainName = `${node.name}-Chain`;
+    if (existingNames.has(node.name) && existingNames.has(chainName)) {
       skippedNodes.push(node.name);
       continue;
     }
     existingNames.add(node.name);
+    existingNames.add(chainName);
     addedNodes.push(node);
   }
   if (addedNodes.length === 0) {
-    fail("所有待加入链式代理节点名称都已存在，无法新增");
+    fail("所有待加入代理节点名称都已存在，无法新增");
+  }
+
+  // 构建所有新增节点的名称列表（独立 + 链式）
+  const allNewNames = [];
+  for (const node of addedNodes) {
+    allNewNames.push(node.name);
+    allNewNames.push(`${node.name}-Chain`);
   }
 
   const alreadyHasSshDirectRule = hasSshDirectRule(lines);
@@ -133,13 +163,14 @@ function transformYaml(sourceText, proxyNodes) {
     if (!insertedProxyNodes && isTopLevelKeyLine(line, "proxies")) {
       out.push(line);
       for (const node of addedNodes) {
-        out.push(`  - name: ${node.name}`);
-        out.push("    type: socks5");
-        out.push(`    server: ${node.server}`);
-        out.push(`    port: ${node.port}`);
-        out.push(`    username: ${node.username}`);
-        out.push(`    password: ${node.password}`);
-        out.push(`    dialer-proxy: ${dialerGroup}`);
+        // 独立代理节点（不带 dialer-proxy）
+        for (const l of buildProxyYamlLines(node, null)) {
+          out.push(l);
+        }
+        // 链式代理节点（带 dialer-proxy）
+        for (const l of buildProxyYamlLines(node, dialerGroup)) {
+          out.push(l);
+        }
       }
       insertedProxyNodes = true;
       continue;
@@ -150,8 +181,8 @@ function transformYaml(sourceText, proxyNodes) {
     } else if (inGroups && /^[^\s]/.test(line)) {
       if (inFirstGroup && !insertedFirstGroupRef) {
         out.push("    proxies:");
-        for (const node of addedNodes) {
-          out.push(`      - ${node.name}`);
+        for (const n of allNewNames) {
+          out.push(`      - ${n}`);
         }
         insertedFirstGroupRef = true;
       }
@@ -166,8 +197,8 @@ function transformYaml(sourceText, proxyNodes) {
       } else if (seenFirstGroup && inFirstGroup && /^  - name:\s*/.test(line)) {
         if (!insertedFirstGroupRef) {
           out.push("    proxies:");
-          for (const node of addedNodes) {
-            out.push(`      - ${node.name}`);
+          for (const n of allNewNames) {
+            out.push(`      - ${n}`);
           }
           insertedFirstGroupRef = true;
         }
@@ -176,8 +207,8 @@ function transformYaml(sourceText, proxyNodes) {
 
       if (inFirstGroup && !insertedFirstGroupRef && /^    proxies:\s*$/.test(line)) {
         out.push(line);
-        for (const node of addedNodes) {
-          out.push(`      - ${node.name}`);
+        for (const n of allNewNames) {
+          out.push(`      - ${n}`);
         }
         insertedFirstGroupRef = true;
         continue;
@@ -189,8 +220,8 @@ function transformYaml(sourceText, proxyNodes) {
 
   if (inGroups && inFirstGroup && !insertedFirstGroupRef) {
     out.push("    proxies:");
-    for (const node of addedNodes) {
-      out.push(`      - ${node.name}`);
+    for (const n of allNewNames) {
+      out.push(`      - ${n}`);
     }
     insertedFirstGroupRef = true;
   }
