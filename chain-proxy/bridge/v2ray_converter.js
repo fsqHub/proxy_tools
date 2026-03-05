@@ -51,6 +51,8 @@ function parseVlessUri(uri) {
     const params = new URLSearchParams(queryStr);
     const security = params.get("security") || "";
     const sni = params.get("sni") || "";
+    const allowInsecure = params.get("allowInsecure");
+    const skipCertVerify = allowInsecure === "0" || allowInsecure === "false" ? false : true;
     const fp = params.get("fp") || "";
     const pbk = params.get("pbk") || "";
     const sid = params.get("sid") || "";
@@ -67,7 +69,7 @@ function parseVlessUri(uri) {
         port,
         uuid,
         udp: true,
-        "skip-cert-verify": false,
+        "skip-cert-verify": skipCertVerify,
     };
 
     // TLS / Reality
@@ -127,6 +129,11 @@ function parseVmessUri(uri) {
     const obj = safeJsonParse(decoded);
     if (!obj || !obj.add || !obj.port || !obj.id) return null;
 
+    let skipCertVerify = true;
+    if (obj.allowInsecure !== undefined) {
+        skipCertVerify = String(obj.allowInsecure) !== "0" && String(obj.allowInsecure) !== "false";
+    }
+
     const node = {
         name: obj.ps || `vmess-${obj.add}:${obj.port}`,
         type: "vmess",
@@ -136,7 +143,7 @@ function parseVmessUri(uri) {
         alterId: Number(obj.aid || 0),
         cipher: obj.scy || "auto",
         udp: true,
-        "skip-cert-verify": false,
+        "skip-cert-verify": skipCertVerify,
     };
 
     const tls = (obj.tls || "").toLowerCase();
@@ -194,6 +201,8 @@ function parseTrojanUri(uri) {
     const params = new URLSearchParams(queryStr);
     const sni = params.get("sni") || "";
     const alpn = params.get("alpn") || "";
+    const allowInsecure = params.get("allowInsecure");
+    const skipCertVerify = allowInsecure === "0" || allowInsecure === "false" ? false : true;
 
     const node = {
         name: name || `trojan-${server}:${port}`,
@@ -202,7 +211,7 @@ function parseTrojanUri(uri) {
         port,
         password,
         udp: true,
-        "skip-cert-verify": false,
+        "skip-cert-verify": skipCertVerify,
     };
 
     if (sni) node.sni = sni;
